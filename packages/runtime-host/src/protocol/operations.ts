@@ -3,6 +3,8 @@ import { AGENT_GRAPH_OPERATION_SPECS } from './agent-graph.js';
 import { AUTOMATION_OPERATION_SPECS } from './automation.js';
 import { requireExactRecord, requireId, requireRecord, requireString } from './codec.js';
 import { CONNECTION_EFFECT_OPERATION_SPECS } from './connection-effects.js';
+import { DEEP_RESEARCH_OPERATION_SPECS } from './deep-research.js';
+import { DAILY_REVIEW_OPERATION_SPECS } from './daily-review.js';
 import { CONTEXT_OPERATION_SPECS } from './context.js';
 import { EXECUTION_INSPECT_OPERATION_SPECS } from './execution-inspect.js';
 import { CLIENT_CAPABILITY_OPERATION_SPECS } from './client-capability.js';
@@ -24,6 +26,7 @@ import { RUNTIME_POLICY_OPERATION_SPECS } from './runtime-policy.js';
 import { RUNTIME_RESOURCE_OPERATION_SPECS } from './runtime-resource.js';
 import { SESSION_CATALOG_OPERATION_SPECS } from './session-catalog.js';
 import { SESSION_CONTINUITY_OPERATION_SPECS } from './session-continuity.js';
+import { SESSION_TRANSCRIPT_OPERATION_SPECS } from './session-transcript.js';
 import { SESSION_REVISION_OPERATION_SPECS } from './session-revision.js';
 import { SESSION_RETIREMENT_OPERATION_SPECS } from './session-retirement.js';
 import { SESSION_EFFECT_OPERATION_SPECS } from './session-effects.js';
@@ -106,6 +109,8 @@ export type {
   TurnStopInput,
 } from './turn.js';
 export * from './connection-effects.js';
+export * from './deep-research.js';
+export * from './daily-review.js';
 export * from './context.js';
 export * from './agent-graph.js';
 export * from './execution-inspect.js';
@@ -119,6 +124,7 @@ export * from './runtime-resource.js';
 export * from './session-catalog.js';
 export * from './session-revision.js';
 export * from './session-retirement.js';
+export * from './session-transcript.js';
 export * from './session-effects.js';
 export * from './skill-catalog.js';
 export * from './usage-pricing.js';
@@ -130,6 +136,8 @@ export const HOST_OPERATION_SPECS = composeOperationSpecMaps(
   TURN_OPERATION_SPECS,
   CONTEXT_OPERATION_SPECS,
   CONNECTION_EFFECT_OPERATION_SPECS,
+  DEEP_RESEARCH_OPERATION_SPECS,
+  DAILY_REVIEW_OPERATION_SPECS,
   EXECUTION_INSPECT_OPERATION_SPECS,
   RUNTIME_POLICY_OPERATION_SPECS,
   RUNTIME_RESOURCE_OPERATION_SPECS,
@@ -139,6 +147,7 @@ export const HOST_OPERATION_SPECS = composeOperationSpecMaps(
   TASK_LEDGER_OPERATION_SPECS,
   INTERACTION_OPERATION_SPECS,
   SESSION_CONTINUITY_OPERATION_SPECS,
+  SESSION_TRANSCRIPT_OPERATION_SPECS,
   SESSION_CATALOG_OPERATION_SPECS,
   SESSION_EFFECT_OPERATION_SPECS,
   SESSION_REVISION_OPERATION_SPECS,

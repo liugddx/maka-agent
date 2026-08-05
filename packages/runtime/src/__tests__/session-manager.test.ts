@@ -14899,7 +14899,7 @@ describe('SessionManager permission mode updates', () => {
       .sendMessage(session.id, { turnId: 'turn-1', text: 'hello' })
       [Symbol.asyncIterator]();
     expect((await iterator.next()).value?.type).toBe('sandbox_boundary_request');
-    const [activeBoundaryRequest] = await manager.listActiveSandboxBoundaryRequests(session.id);
+    const [activeBoundaryRequest] = await manager.listActiveInteractions(session.id);
     expect(activeBoundaryRequest).toMatchObject({
       type: 'sandbox_boundary_request',
       requestId: 'boundary-1',
@@ -14919,9 +14919,99 @@ describe('SessionManager permission mode updates', () => {
     });
     expect(backend?.responses).toEqual([{ requestId: 'boundary-1', decision: 'deny' }]);
     expect((await iterator.next()).value?.type).toBe('sandbox_boundary_decision_ack');
-    expect(await manager.listActiveSandboxBoundaryRequests(session.id)).toEqual([]);
+    expect(await manager.listActiveInteractions(session.id)).toEqual([]);
     while (!(await iterator.next()).done) {}
     expect((await store.readHeader(session.id)).status).toBe('active');
+  });
+
+  test('lists an unanswered user question until its answer ack lands', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    backends.register('fake', (ctx) => new FakeBackend(ctx));
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(9_000),
+    });
+    const session = await manager.createSession(makeInput({ backend: 'fake' }));
+
+    const iterator = manager
+      .sendMessage(session.id, { turnId: 'turn-1', text: FAKE_ASK_USER_QUESTION_PROMPT })
+      [Symbol.asyncIterator]();
+    let request: SessionEvent | undefined;
+    while (request?.type !== 'user_question_request') {
+      const next = await iterator.next();
+      if (next.done) break;
+      request = next.value;
+    }
+    expect(request?.type).toBe('user_question_request');
+
+    // The surface that raised this request may never have been mounted, so the
+    // request has to be readable back from the kernel (#2072).
+    const active = await manager.listActiveInteractions(session.id);
+    expect(active).toEqual([request]);
+
+    const requestId = (request as Extract<SessionEvent, { type: 'user_question_request' }>)
+      .requestId;
+    // One registry now holds both request kinds, so answering a question as if
+    // it were a boundary must settle nothing and leave the entry intact.
+    await expectRejects(
+      manager.respondToSandboxBoundary(session.id, { requestId, decision: 'deny' }),
+      /No pending sandbox boundary request/,
+    );
+    expect(await manager.listActiveInteractions(session.id)).toEqual([request]);
+
+    await manager.respondToUserQuestion(session.id, {
+      requestId,
+      answers: ['邀请制', '本周', '是'],
+    });
+    let ack: SessionEvent | undefined;
+    while (ack?.type !== 'user_question_answer_ack') {
+      const next = await iterator.next();
+      if (next.done) break;
+      ack = next.value;
+    }
+    expect(ack?.type).toBe('user_question_answer_ack');
+    expect(await manager.listActiveInteractions(session.id)).toEqual([]);
+    while (!(await iterator.next()).done) {}
+  });
+
+  test('releases a question abandoned by a stopped turn', async () => {
+    const store = new MemorySessionStore();
+    const runStore = new MemoryAgentRunStore();
+    const backends = new BackendRegistry();
+    backends.register('fake', (ctx) => new FakeBackend(ctx));
+    const manager = new SessionManager({
+      store,
+      runStore,
+      runtimeEventStore: runStore,
+      backends,
+      newId: nextId(),
+      now: nextNow(9_000),
+    });
+    const session = await manager.createSession(makeInput({ backend: 'fake' }));
+
+    const iterator = manager
+      .sendMessage(session.id, { turnId: 'turn-1', text: FAKE_ASK_USER_QUESTION_PROMPT })
+      [Symbol.asyncIterator]();
+    let request: SessionEvent | undefined;
+    while (request?.type !== 'user_question_request') {
+      const next = await iterator.next();
+      if (next.done) break;
+      request = next.value;
+    }
+    expect(request?.type).toBe('user_question_request');
+
+    // A stop settles no answer, so this question never gets its ack. Only the
+    // turn-end release keeps it from being read back as a prompt for a dead
+    // run — one nothing could answer, since the backend generation is gone.
+    await manager.stopSession(session.id, { source: 'stop_button' });
+    while (!(await iterator.next()).done) {}
+    expect(await manager.listActiveInteractions(session.id)).toEqual([]);
   });
 
   test('reads a completed session back after a sandbox boundary allow', async () => {
@@ -17857,7 +17947,7 @@ describe('SessionManager permission mode updates', () => {
     expect((await store.readHeader(child.id)).projectId).toBe(null);
   });
 
-  test('fails before creating branch or revision sessions that need typed authority-fact rewriting', async () => {
+  test('branch and revision sessions rewrite tool operation authority facts', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const backends = new BackendRegistry();
@@ -17965,29 +18055,33 @@ describe('SessionManager permission mode updates', () => {
       ],
     );
 
-    const attempts = [
-      () =>
-        manager.branchFromTurn(session.id, {
-          sourceTurnId: 'authority-source-turn',
-          name: 'Blocked branch',
-        }),
-      () =>
-        manager.branchBeforeTurn(session.id, {
-          sourceTurnId: 'authority-later-turn',
-          name: 'Blocked before branch',
-        }),
-      () =>
-        manager.reviseBeforeTurn(session.id, {
-          sourceTurnId: 'authority-later-turn',
-        }),
+    const copies = [
+      await manager.branchFromTurn(session.id, {
+        sourceTurnId: 'authority-source-turn',
+        name: 'Tool branch',
+      }),
+      await manager.branchBeforeTurn(session.id, {
+        sourceTurnId: 'authority-later-turn',
+        name: 'Tool branch before later turn',
+      }),
+      await manager.reviseBeforeTurn(session.id, {
+        sourceTurnId: 'authority-later-turn',
+      }),
     ];
-    for (const attempt of attempts) {
-      await expectRejects(attempt(), /typed identity rewriting/i);
-      expect((await store.list()).map((candidate) => candidate.id)).toEqual([session.id]);
+    for (const copy of copies) {
+      const [targetRun] = await runStore.listSessionRuns(copy.id);
+      assert.ok(targetRun);
+      const targetEvents = await runStore.readRuntimeEvents(copy.id, targetRun.runId);
+      const dispatch = targetEvents.find((event) => event.actions?.toolDispatch);
+      const targetOperationId = dispatch?.actions?.toolDispatch?.operationId;
+      assert.ok(targetOperationId);
+      assert.notEqual(targetOperationId, 'authority-operation');
+      assert.equal(dispatch?.refs?.operationId, targetOperationId);
+      assert.equal(targetRun.sessionId, copy.id);
     }
   });
 
-  test('fails before cloning a legacy v1 continuation source until typed rewriting exists', async () => {
+  test('fails before creating branch or revision sessions for child continuation authority', async () => {
     const store = new MemorySessionStore();
     const runStore = new MemoryAgentRunStore();
     const manager = new SessionManager({
@@ -18004,8 +18098,46 @@ describe('SessionManager permission mode updates', () => {
       runStore,
       makeRunHeader({
         sessionId: session.id,
+        runId: 'continuation-parent-run',
+        turnId: 'continuation-parent-turn',
+        status: 'completed',
+        cwd: header.cwd,
+        createdAt: 1,
+        updatedAt: 2,
+        completedAt: 2,
+      }),
+      [
+        runtimeEvent({
+          id: 'continuation-parent-user',
+          sessionId: session.id,
+          invocationId: 'continuation-parent-invocation',
+          runId: 'continuation-parent-run',
+          turnId: 'continuation-parent-turn',
+          ts: 1,
+          role: 'user',
+          author: 'user',
+          content: { kind: 'text', text: 'retain parent and child closure' },
+        }),
+        runtimeEvent({
+          id: 'continuation-parent-terminal',
+          sessionId: session.id,
+          invocationId: 'continuation-parent-invocation',
+          runId: 'continuation-parent-run',
+          turnId: 'continuation-parent-turn',
+          ts: 2,
+          status: 'completed',
+          actions: { endInvocation: true },
+        }),
+      ],
+    );
+    await seedRuntimeRun(
+      runStore,
+      makeRunHeader({
+        sessionId: session.id,
         runId: 'legacy-continuation-run',
-        turnId: 'legacy-continuation-turn',
+        turnId: 'legacy-child-turn',
+        parentRunId: 'continuation-parent-run',
+        agentId: 'child-agent',
         status: 'completed',
         cwd: header.cwd,
         continuationSource: {
@@ -18014,9 +18146,9 @@ describe('SessionManager permission mode updates', () => {
           sourceTurnId: 'legacy-source-turn',
           sourceRuntimeEventHighWater: 1,
         },
-        createdAt: 1,
-        updatedAt: 2,
-        completedAt: 2,
+        createdAt: 3,
+        updatedAt: 4,
+        completedAt: 4,
       }),
       [
         runtimeEvent({
@@ -18024,8 +18156,8 @@ describe('SessionManager permission mode updates', () => {
           sessionId: session.id,
           invocationId: 'legacy-continuation-run',
           runId: 'legacy-continuation-run',
-          turnId: 'legacy-continuation-turn',
-          ts: 1,
+          turnId: 'legacy-child-turn',
+          ts: 3,
           role: 'user',
           author: 'user',
           content: { kind: 'text', text: 'legacy continuation history' },
@@ -18035,21 +18167,69 @@ describe('SessionManager permission mode updates', () => {
           sessionId: session.id,
           invocationId: 'legacy-continuation-run',
           runId: 'legacy-continuation-run',
-          turnId: 'legacy-continuation-turn',
-          ts: 2,
+          turnId: 'legacy-child-turn',
+          ts: 4,
+          status: 'completed',
+          actions: { endInvocation: true },
+        }),
+      ],
+    );
+    await seedRuntimeRun(
+      runStore,
+      makeRunHeader({
+        sessionId: session.id,
+        runId: 'continuation-later-run',
+        turnId: 'continuation-later-turn',
+        status: 'completed',
+        cwd: header.cwd,
+        createdAt: 5,
+        updatedAt: 6,
+        completedAt: 6,
+      }),
+      [
+        runtimeEvent({
+          id: 'continuation-later-user',
+          sessionId: session.id,
+          invocationId: 'continuation-later-invocation',
+          runId: 'continuation-later-run',
+          turnId: 'continuation-later-turn',
+          ts: 5,
+          role: 'user',
+          author: 'user',
+          content: { kind: 'text', text: 'later boundary' },
+        }),
+        runtimeEvent({
+          id: 'continuation-later-terminal',
+          sessionId: session.id,
+          invocationId: 'continuation-later-invocation',
+          runId: 'continuation-later-run',
+          turnId: 'continuation-later-turn',
+          ts: 6,
           status: 'completed',
           actions: { endInvocation: true },
         }),
       ],
     );
 
-    await expectRejects(
-      manager.branchFromTurn(session.id, {
-        sourceTurnId: 'legacy-continuation-turn',
-        name: 'Blocked legacy branch',
-      }),
-      /typed identity rewriting/i,
-    );
+    const attempts = [
+      () =>
+        manager.branchFromTurn(session.id, {
+          sourceTurnId: 'continuation-parent-turn',
+          name: 'Blocked child continuation branch',
+        }),
+      () =>
+        manager.branchBeforeTurn(session.id, {
+          sourceTurnId: 'continuation-later-turn',
+          name: 'Blocked child continuation branch before',
+        }),
+      () =>
+        manager.reviseBeforeTurn(session.id, {
+          sourceTurnId: 'continuation-later-turn',
+        }),
+    ];
+    for (const attempt of attempts) {
+      await expectRejects(attempt(), /typed identity rewriting/i);
+    }
     expect((await store.list()).map((candidate) => candidate.id)).toEqual([session.id]);
   });
 
@@ -18084,6 +18264,9 @@ describe('SessionManager permission mode updates', () => {
     const shellRuns = {
       async listSessionUpdates() {
         return [];
+      },
+      async getSessionUpdate() {
+        return undefined;
       },
       async inspectResource(sessionId: string, candidateRef: string) {
         if (ownerAvailable && candidateRef === ref && sessionId === 'session-1')
@@ -18233,6 +18416,10 @@ describe('SessionManager permission mode updates', () => {
     });
     expect(updates[0]?.sourceToolCallId).toBe('bash-1');
     expect(updates[0]?.result).toEqual(sourceSnapshot);
+    expect(await manager.getShellRunUpdate(child.id, sourceSnapshot.ref)).toEqual(updates[0]);
+    expect(
+      await manager.getShellRunUpdate(child.id, 'maka://runtime/background-tasks/missing-shell'),
+    ).toBeNull();
 
     const revisionUpdates = await manager.listShellRunUpdates(revision.id);
     expect(revisionUpdates).toHaveLength(1);
@@ -18254,6 +18441,9 @@ describe('SessionManager permission mode updates', () => {
     });
     expect(danglingUpdates[0]?.result.status).toBe('running');
     expect(danglingUpdates[0]?.result.output).toBe(undefined);
+    expect(await manager.getShellRunUpdate(child.id, sourceSnapshot.ref)).toEqual(
+      danglingUpdates[0],
+    );
   });
 
   test('branchFromTurn preserves parent thinking, collaboration, and orchestration modes', async () => {

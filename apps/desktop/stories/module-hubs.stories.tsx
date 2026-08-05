@@ -10,6 +10,7 @@ import {
   getSharedUiCopy,
   ModuleHubSelector,
   SkillsPage,
+  type ManagedSkillUpdatePreview,
   type SkillEntry,
   ToastProvider,
   useUiLocale,
@@ -49,31 +50,130 @@ const CONFIGURED_COMPLETED_LAST_RUN = {
 
 const INSTALLED_SKILLS: SkillEntry[] = [
   {
+    ref: 'workspace:maka:skill-git-flow',
     id: 'skill-git-flow',
     name: 'git-flow',
     description: '封装分支创建、合并与发布打 tag 的常用 git 操作。',
     path: '~/.maka/skills/git-flow',
     declaredTools: ['Bash', 'Write'],
+    sourceType: 'workspace',
+    scope: 'workspace',
+    contextStatus: 'advertised',
+    manageable: true,
     enabled: true,
     runtimeStatus: 'enabled',
   },
   {
+    ref: 'user:agents:skill-docs-screenshot',
     id: 'skill-docs-screenshot',
     name: 'docs-screenshot',
     description: '把组件截图同步进设计文档，按 token 分类命名。',
     path: '~/.maka/skills/docs-screenshot',
     declaredTools: ['Bash', 'Read'],
+    sourceType: 'workspace',
+    scope: 'user',
+    contextStatus: 'disabled',
+    manageable: true,
     enabled: false,
     runtimeStatus: 'disabled',
   },
   {
+    ref: 'project:maka:skill-release-notes',
     id: 'skill-release-notes',
     name: 'release-notes',
     description: '从最近的 commit 历史生成发布说明草稿。',
     path: '~/.maka/skills/release-notes',
     declaredTools: ['Bash'],
+    sourceType: 'bundled',
+    scope: 'project',
+    contextStatus: 'advertised',
+    manageable: false,
     enabled: true,
     runtimeStatus: 'enabled',
+  },
+];
+
+const UPDATE_AVAILABLE_SKILLS: SkillEntry[] = [
+  {
+    ref: 'workspace:maka:release-checklist',
+    id: 'release-checklist',
+    name: 'release-checklist',
+    description: '发布前检查版本、测试证据和变更说明。',
+    path: '~/.maka/skills/release-checklist',
+    declaredTools: ['Bash', 'Read'],
+    sourceType: 'managed',
+    managedUpdateStatus: 'update_available',
+    scope: 'workspace',
+    contextStatus: 'advertised',
+    manageable: true,
+    enabled: true,
+    runtimeStatus: 'enabled',
+  },
+];
+
+const UPDATE_AVAILABLE_PREVIEW: ManagedSkillUpdatePreview = {
+  skill: {
+    id: 'release-checklist',
+    name: 'release-checklist',
+    description: '发布前检查版本、测试证据和变更说明。',
+    path: '~/.maka/skills/release-checklist/SKILL.md',
+    declaredTools: ['Bash', 'Read'],
+    sourceType: 'managed',
+    userModified: false,
+    validationStatus: 'ok',
+    enabled: true,
+    runtimeStatus: 'enabled',
+    validationCodes: [],
+    validationMessages: [],
+    managedSourceId: 'release-checklist-source',
+    managedUpdateStatus: 'update_available',
+    hasManagedBaseline: true,
+  },
+  currentContent: '# Release checklist\n\nRun the release tests.',
+  sourceContent: '# Release checklist\n\nRun tests and attach the release evidence.',
+  baselineContent: '# Release checklist\n\nRun the release tests.',
+  expectedCurrentSha256: 'current-story-sha256',
+  expectedSourceSha256: 'source-story-sha256',
+  summary: {
+    currentLineCount: 3,
+    sourceLineCount: 3,
+    changedLineCount: 1,
+  },
+};
+
+const DISABLED_SKILLS: SkillEntry[] = [
+  {
+    ref: 'workspace:maka:spreadsheet-audit',
+    id: 'spreadsheet-audit',
+    name: 'spreadsheet-audit',
+    description: '检查工作簿中的公式、格式和异常值。',
+    path: '~/.maka/skills/spreadsheet-audit',
+    declaredTools: ['Read'],
+    sourceType: 'bundled',
+    scope: 'workspace',
+    contextStatus: 'disabled',
+    manageable: true,
+    enabled: false,
+    runtimeStatus: 'disabled',
+  },
+];
+
+const BUNDLED_SKILLS: NonNullable<ComponentProps<typeof SkillsPage>['bundledSkillCatalog']> = [
+  {
+    id: 'document-review',
+    name: 'Document review',
+    description: 'Review and refine documents before sharing.',
+    category: '文档与写作',
+    declaredTools: ['Read', 'Write'],
+    installed: false,
+  },
+  {
+    id: 'image-workbench',
+    name: 'Image workbench',
+    description: 'Generate and edit visual assets.',
+    category: '设计与UI',
+    declaredTools: ['Read', 'Write'],
+    installed: true,
   },
 ];
 
@@ -166,6 +266,50 @@ const CONFIGURED_REMINDERS: PlanReminder[] = [
       },
     ],
     runCount: 12,
+  },
+  // Eighth reminder: the list's own control bar (search / sort / filter) only
+  // appears at eight, so without this row the story could never show it — and
+  // the controls are the widest thing the page's header carries.
+  {
+    id: 'plan-monthly-audit',
+    title: '每月依赖许可证审计',
+    note: '核对新引入依赖的许可证与来源。',
+    schedule: { kind: 'recurring', startAt: PLAN_NOW - 40 * 86_400_000, recurrence: 'monthly' },
+    delivery: { channel: 'local' },
+    status: 'scheduled',
+    enabled: true,
+    createdAt: PLAN_NOW - 40 * 86_400_000,
+    updatedAt: PLAN_NOW - 9 * 86_400_000,
+    nextRunAt: PLAN_NOW + 6 * 86_400_000,
+    runs: [],
+    runCount: 0,
+  },
+  {
+    id: 'plan-standup',
+    title: '每日站会前汇总阻塞项',
+    note: '',
+    schedule: { kind: 'cron', startAt: PLAN_NOW - 20 * 86_400_000, expression: '30 9 * * 1-5' },
+    delivery: { channel: 'local' },
+    status: 'scheduled',
+    enabled: true,
+    createdAt: PLAN_NOW - 20 * 86_400_000,
+    updatedAt: PLAN_NOW - 3 * 86_400_000,
+    nextRunAt: PLAN_NOW + 20 * 3_600_000,
+    runs: [],
+    runCount: 0,
+  },
+  {
+    id: 'plan-quarter-close',
+    title: '季度收尾清点未归档会话',
+    note: '把仍未归档的会话列成一张清单。',
+    schedule: { kind: 'once', runAt: PLAN_NOW + 21 * 86_400_000 },
+    delivery: { channel: 'local' },
+    status: 'paused',
+    enabled: false,
+    createdAt: PLAN_NOW - 11 * 86_400_000,
+    updatedAt: PLAN_NOW - 4 * 86_400_000,
+    runs: [],
+    runCount: 0,
   },
 ];
 
@@ -274,12 +418,33 @@ const configuredMcpConfig: McpConfigFile = {
       command: 'npx',
       args: ['-y', '@modelcontextprotocol/server-filesystem', '/Users/yuhan/workspace'],
     },
-    'team-tools': {
-      enabled: true,
-      url: 'https://mcp.example.com/team/tools',
-      transport: 'streamable-http',
+    'linear-remote': {
+      enabled: false,
+      url: 'https://mcp.linear.app/sse',
+      transport: 'sse',
     },
   },
+};
+
+const editorMcpConfig: McpConfigFile = {
+  version: 1,
+  mcpServers: {
+    slack: {
+      enabled: false,
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-slack@2025.4.25'],
+      env: { SLACK_BOT_TOKEN: '', SLACK_TEAM_ID: '', SLACK_CHANNEL_IDS: '' },
+    },
+  },
+};
+
+const editorMcpStatus: McpServerStatus = {
+  serverId: 'slack',
+  state: 'disabled',
+  transport: 'stdio',
+  toolCount: 0,
+  tools: [],
+  updatedAt: NOW,
 };
 
 const configuredMcpStatuses: McpServerStatus[] = [
@@ -294,6 +459,28 @@ const configuredMcpStatuses: McpServerStatus[] = [
     ],
     updatedAt: NOW,
   },
+  {
+    serverId: 'linear-remote',
+    state: 'disabled',
+    transport: 'sse',
+    toolCount: 0,
+    tools: [],
+    updatedAt: NOW,
+  },
+];
+
+const failedMcpConfig: McpConfigFile = {
+  version: 1,
+  mcpServers: {
+    'team-tools': {
+      enabled: true,
+      url: 'https://mcp.example.com/team/tools',
+      transport: 'streamable-http',
+    },
+  },
+};
+
+const failedMcpStatuses: McpServerStatus[] = [
   {
     serverId: 'team-tools',
     state: 'error',
@@ -321,6 +508,51 @@ const withConfiguredMcpBridge = withScopedMakaBridge({
   },
 });
 
+const withEditorMcpBridge = withScopedMakaBridge({
+  mcp: {
+    getConfig: async () => editorMcpConfig,
+    listStatuses: async () => [editorMcpStatus],
+    setConfig: async () => editorMcpConfig,
+    upsert: async () => editorMcpConfig,
+    install: async () => editorMcpConfig,
+    remove: async () => editorMcpConfig,
+    cancelInstall: async () => editorMcpConfig,
+    test: async () => ({ ok: false, status: editorMcpStatus, latencyMs: 0 }),
+    reconnect: async () => editorMcpStatus,
+    subscribeChanges: () => () => {},
+  },
+});
+
+const withEmptyMcpBridge = withScopedMakaBridge({
+  mcp: {
+    getConfig: async () => ({ version: 1, mcpServers: {} }),
+    listStatuses: async () => [],
+    setConfig: async () => ({ version: 1, mcpServers: {} }),
+    upsert: async () => ({ version: 1, mcpServers: {} }),
+    install: async () => ({ version: 1, mcpServers: {} }),
+    remove: async () => ({ version: 1, mcpServers: {} }),
+    cancelInstall: async () => ({ version: 1, mcpServers: {} }),
+    test: async () => ({ ok: true, status: configuredMcpStatuses[0], latencyMs: 42 }),
+    reconnect: async () => configuredMcpStatuses[0],
+    subscribeChanges: () => () => {},
+  },
+});
+
+const withFailedMcpBridge = withScopedMakaBridge({
+  mcp: {
+    getConfig: async () => failedMcpConfig,
+    listStatuses: async () => failedMcpStatuses,
+    setConfig: async () => failedMcpConfig,
+    upsert: async () => failedMcpConfig,
+    install: async () => failedMcpConfig,
+    remove: async () => failedMcpConfig,
+    cancelInstall: async () => failedMcpConfig,
+    test: async () => ({ ok: false, status: failedMcpStatuses[0], latencyMs: 30_000 }),
+    reconnect: async () => failedMcpStatuses[0],
+    subscribeChanges: () => () => {},
+  },
+});
+
 function ModuleSurface(props: {
   children: ReactNode;
   agentsView: 'skills' | 'mcp' | 'cron' | 'daily-review';
@@ -341,10 +573,6 @@ function ModuleSurface(props: {
           workbarAvailable={false}
           workbarCollapsed
           onToggleWorkbar={noop}
-          onOpenFeedback={noop}
-          onOpenPalette={noop}
-          onOpenHelp={noop}
-          onOpenHealth={noop}
         />
         <ToastProvider>{props.children}</ToastProvider>
       </AppShellDetailPanel>
@@ -352,7 +580,11 @@ function ModuleSurface(props: {
   );
 }
 
-function ExtensionsSkillsSurface(props: { skills?: SkillEntry[] }) {
+function ExtensionsSkillsSurface(props: {
+  skills?: SkillEntry[];
+  bundledSkillCatalog?: NonNullable<ComponentProps<typeof SkillsPage>['bundledSkillCatalog']>;
+  onUpdateManagedSkill?: ComponentProps<typeof SkillsPage>['onUpdateManagedSkill'];
+}) {
   const copy = getSharedUiCopy(useUiLocale()).moduleHubs.extensions;
   return (
     <ModuleSurface agentsView="skills">
@@ -364,10 +596,21 @@ function ExtensionsSkillsSurface(props: { skills?: SkillEntry[] }) {
         }}
         skills={props.skills ?? []}
         managedSkillSources={[]}
-        bundledSkillCatalog={[]}
+        bundledSkillCatalog={props.bundledSkillCatalog ?? []}
         onRefreshSkills={noop}
+        onRefreshManagedSkillSources={noop}
+        onRefreshBundledSkillCatalog={noop}
         onOpenSkill={noop}
+        onUseSkill={noop}
         onOpenSkillsFolder={noop}
+        onInstallBundledSkill={noop}
+        onPreviewManagedSkillUpdate={async (skillId) => (
+          skillId === UPDATE_AVAILABLE_PREVIEW.skill.id ? UPDATE_AVAILABLE_PREVIEW : null
+        )}
+        onUpdateManagedSkill={props.onUpdateManagedSkill ?? (async () => true)}
+        onSetSkillEnabled={noop}
+        onSetSkillPinned={noop}
+        onDeleteSkill={noop}
       />
     </ModuleSurface>
   );
@@ -450,6 +693,20 @@ async function waitForStoryButton(
   throw new Error('Story action button did not render');
 }
 
+async function waitForStoryMenuItem(
+  canvasElement: HTMLElement,
+  predicate: (menuItem: HTMLElement) => boolean,
+): Promise<HTMLElement> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const menuItem = Array.from(
+      canvasElement.querySelectorAll<HTMLElement>('[role="menuitem"]'),
+    ).find(predicate);
+    if (menuItem) return menuItem;
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 20));
+  }
+  throw new Error('Story menu item did not render');
+}
+
 async function waitForStorySelector<T extends Element>(
   canvasElement: HTMLElement,
   selector: string,
@@ -470,12 +727,115 @@ async function waitForStoryText(canvasElement: HTMLElement, text: string): Promi
   throw new Error(`Story text did not render: ${text}`);
 }
 
-// Real path: sidebar → 扩展 → 技能, with several installed skills.
+// Real path: sidebar → 扩展 → 技能, before any Skill or bundled catalog entry exists.
+export const ExtensionsSkillsEmpty: Story = {
+  render: () => <ExtensionsSkillsSurface />,
+};
+
+// Real path: sidebar → 扩展 → 技能, with several installed Skills.
 export const ExtensionsSkillsInstalled: Story = {
   render: () => <ExtensionsSkillsSurface skills={INSTALLED_SKILLS} />,
 };
 
-// Real path: sidebar → 扩展 → MCP, with one healthy server and one actionable failure.
+// Real path: sidebar → 扩展 → 技能, with bundled Skills available to install.
+export const ExtensionsSkillsBundled: Story = {
+  render: () => <ExtensionsSkillsSurface bundledSkillCatalog={BUNDLED_SKILLS} />,
+};
+
+// Real path: sidebar → 扩展 → 技能, after a managed source reports an update.
+export const ExtensionsSkillsUpdateAvailable: Story = {
+  render: function Render() {
+    const [updateInput, setUpdateInput] = useState<unknown>(null);
+    return (
+      <>
+        <ExtensionsSkillsSurface
+          skills={UPDATE_AVAILABLE_SKILLS}
+          onUpdateManagedSkill={async (skillId, options) => {
+            setUpdateInput({ skillId, options });
+            return true;
+          }}
+        />
+        <output data-testid="skills-update-input" hidden>
+          {updateInput ? JSON.stringify(updateInput) : ''}
+        </output>
+      </>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const moreActions = await waitForStoryButton(
+      canvasElement,
+      (candidate) => candidate.getAttribute('aria-label') === 'release-checklist 的更多操作',
+    );
+    moreActions.click();
+
+    const storyDocument = canvasElement.ownerDocument.documentElement;
+    const viewUpdate = await waitForStoryMenuItem(
+      storyDocument,
+      (candidate) => candidate.textContent?.includes('查看更新') === true,
+    );
+    viewUpdate.click();
+
+    const review = await waitForStorySelector<HTMLElement>(
+      canvasElement,
+      '[aria-label="Skill 更新审查"]',
+    );
+    await expect(review.textContent).toContain(UPDATE_AVAILABLE_PREVIEW.currentContent);
+    await expect(review.textContent).toContain(UPDATE_AVAILABLE_PREVIEW.sourceContent);
+
+    const applyUpdate = await waitForStoryButton(
+      review,
+      (candidate) => candidate.textContent?.trim() === '更新到来源版本',
+    );
+    applyUpdate.click();
+
+    const output = await waitForStorySelector<HTMLOutputElement>(
+      canvasElement,
+      '[data-testid="skills-update-input"]',
+    );
+    await waitForStoryText(output, UPDATE_AVAILABLE_PREVIEW.expectedSourceSha256);
+    const input = JSON.parse(output.textContent ?? '') as Record<string, unknown>;
+    await expect(input).toEqual({
+      skillId: UPDATE_AVAILABLE_PREVIEW.skill.id,
+      options: {
+        expectedCurrentSha256: UPDATE_AVAILABLE_PREVIEW.expectedCurrentSha256,
+        expectedSourceSha256: UPDATE_AVAILABLE_PREVIEW.expectedSourceSha256,
+      },
+    });
+  },
+};
+
+// Real path: sidebar → 扩展 → 技能, with an installed Skill disabled.
+export const ExtensionsSkillsDisabled: Story = {
+  render: () => <ExtensionsSkillsSurface skills={DISABLED_SKILLS} />,
+};
+
+// Real path: sidebar → 扩展 → 技能, at a narrow desktop window.
+export const ExtensionsSkillsNarrow: Story = {
+  render: () => <ExtensionsSkillsSurface skills={INSTALLED_SKILLS} />,
+  parameters: { viewport: { defaultViewport: 'mobile2' } },
+};
+
+// Real path: sidebar → 扩展 → MCP, before any server has been configured.
+export const ExtensionsMcpSetupRequired: Story = {
+  decorators: [withEmptyMcpBridge],
+  render: () => <ExtensionsMcpSurface />,
+  play: async ({ canvasElement }) => {
+    const installed = await waitForStorySelector<HTMLButtonElement>(
+      canvasElement,
+      '[data-tab-value="installed"]',
+    );
+    installed.click();
+    await waitForStoryText(canvasElement, '还没有安装 MCP');
+  },
+};
+
+// Real path: sidebar → 扩展 → MCP, browsing catalog entries with existing configuration.
+export const ExtensionsMcpMarketplace: Story = {
+  decorators: [withConfiguredMcpBridge],
+  render: () => <ExtensionsMcpSurface />,
+};
+
+// Real path: sidebar → 扩展 → MCP, with connected and disabled servers.
 export const ExtensionsMcpConfigured: Story = {
   decorators: [withConfiguredMcpBridge],
   render: () => <ExtensionsMcpSurface />,
@@ -485,6 +845,40 @@ export const ExtensionsMcpConfigured: Story = {
     installed.click();
     await new Promise((resolve) => window.setTimeout(resolve, 0));
   },
+};
+
+// Real path: sidebar → 扩展 → MCP → Slack 管理, with credential fields visible.
+export const ExtensionsMcpEditor: Story = {
+  decorators: [withEditorMcpBridge],
+  render: () => <ExtensionsMcpSurface />,
+  play: async ({ canvasElement }) => {
+    const manage = await waitForStoryButton(
+      canvasElement,
+      (button) => button.textContent?.trim() === '管理',
+    );
+    manage.click();
+    await waitForStoryText(canvasElement.ownerDocument.body, '编辑 slack');
+  },
+};
+
+// Real path: sidebar → 扩展 → MCP, after an enabled remote server fails to connect.
+export const ExtensionsMcpConnectionFailed: Story = {
+  decorators: [withFailedMcpBridge],
+  render: () => <ExtensionsMcpSurface />,
+  play: async ({ canvasElement }) => {
+    const installed = await waitForStorySelector<HTMLButtonElement>(
+      canvasElement,
+      '[data-tab-value="installed"]',
+    );
+    installed.click();
+    await waitForStoryText(canvasElement, '连接超时，请检查服务器地址或网络代理。');
+  },
+};
+
+// Real path: sidebar → 扩展 → MCP at the narrow desktop viewport floor.
+export const ExtensionsMcpNarrow: Story = {
+  ...ExtensionsMcpConfigured,
+  parameters: { viewport: { defaultViewport: 'mobile2' } },
 };
 
 // Real path: sidebar → 定时任务 → 计划提醒, before any reminder exists.
@@ -501,6 +895,21 @@ export const ScheduledPlanReminders: Story = {
 // plan-reminder-panel.test.tsx asserts its aria-checked in both directions.
 export const ScheduledPlanRemindersConfigured: Story = {
   render: () => <ScheduledPlanRemindersSurface reminders={CONFIGURED_REMINDERS} />,
+};
+
+// Real path: sidebar → 定时任务 → 计划提醒 → click a task row, which opens the
+// inspector where every per-task control now lives. Wide only: below 1024px the
+// page drops the inspector rather than squeeze two columns into one.
+export const ScheduledPlanRemindersInspector: Story = {
+  render: () => <ScheduledPlanRemindersSurface reminders={CONFIGURED_REMINDERS} />,
+  play: async ({ canvasElement }) => {
+    const row = await waitForStoryButton(
+      canvasElement,
+      (candidate) => candidate.textContent?.includes('每周发布风险复盘') === true,
+    );
+    row.click();
+    await waitForStoryText(canvasElement, '立即触发');
+  },
 };
 
 // Real path: sidebar → 定时任务 → 计划提醒, with user-authored content at storage limits.
@@ -562,53 +971,6 @@ export const ScheduledDailyReviewInitialLoadFailed: Story = {
   },
 };
 
-// Real path: sidebar → scheduled tasks → Daily Review while saved reports load.
-export const ScheduledDailyReviewArchivesLoading: Story = {
-  render: () => (
-    <ScheduledDailyReviewSurface
-      bridge={{
-        fetchDay: async () => DAILY_REVIEW_SUMMARY,
-        listArchives: async () => new Promise(() => undefined),
-        runOnce: async () => ({ archiveId: DAILY_REVIEW_ARCHIVE.id }),
-        getArchive: async () => DAILY_REVIEW_ARCHIVE,
-      }}
-    />
-  ),
-  play: async ({ canvasElement }) => {
-    await waitForStorySelector(canvasElement, '.maka-daily-review-content');
-    const generate = await waitForStoryButton(
-      canvasElement,
-      (candidate) => candidate.textContent?.includes('生成分析') === true,
-    );
-    await expect(generate.disabled).toBe(true);
-  },
-};
-
-// Real path: sidebar → scheduled tasks → Daily Review after saved reports fail to load.
-export const ScheduledDailyReviewArchivesFailed: Story = {
-  render: () => (
-    <ScheduledDailyReviewSurface
-      bridge={{
-        fetchDay: async () => DAILY_REVIEW_SUMMARY,
-        listArchives: async () => {
-          throw new Error('archive fixture unavailable');
-        },
-        runOnce: async () => ({ archiveId: DAILY_REVIEW_ARCHIVE.id }),
-        getArchive: async () => DAILY_REVIEW_ARCHIVE,
-      }}
-    />
-  ),
-  play: async ({ canvasElement }) => {
-    await waitForStorySelector(canvasElement, '.maka-daily-review-content');
-    await waitForStoryText(canvasElement, '每日回顾刷新失败');
-    const generate = await waitForStoryButton(
-      canvasElement,
-      (candidate) => candidate.textContent?.includes('生成分析') === true,
-    );
-    await expect(generate.disabled).toBe(true);
-  },
-};
-
 // Real path: sidebar → scheduled tasks → Daily Review while a new range loads.
 export const ScheduledDailyReviewRefreshing: Story = {
   render: () => (
@@ -638,14 +1000,6 @@ export const ScheduledDailyReviewRefreshing: Story = {
     await expect(content.getAttribute('aria-busy')).toBe('true');
     await expect(canvasElement.querySelector('.astryx-skeleton')).toBeNull();
   },
-};
-
-// Real path at a narrow desktop window. The metrics collapse to two columns
-// while the Astryx controls keep their native wrapping behavior.
-// Real path: sidebar → scheduled tasks → Daily Review at a narrow window.
-export const ScheduledDailyReviewNarrow: Story = {
-  ...ScheduledDailyReview,
-  parameters: { viewport: { defaultViewport: 'mobile2' } },
 };
 
 // Real path after an analysis exists and the user opens its dedicated detail route.
@@ -725,34 +1079,5 @@ export const ScheduledDailyReviewReport: Story = {
       ]),
     ].join('\n');
     await expect(input.markdown).toBe(expectedMarkdown);
-  },
-};
-
-// Real path: sidebar → scheduled tasks → Daily Review after a recoverable generation failure.
-export const ScheduledDailyReviewRetryableArchive: Story = {
-  render: () => {
-    const retryableArchive = {
-      ...DAILY_REVIEW_ARCHIVE,
-      status: 'failed' as const,
-      errorMessage: 'temporary fixture failure',
-    };
-    return (
-      <ScheduledDailyReviewSurface
-        bridge={{
-          fetchDay: async () => DAILY_REVIEW_SUMMARY,
-          listArchives: async () => [retryableArchive],
-          runOnce: async () => ({ archiveId: DAILY_REVIEW_ARCHIVE.id }),
-          getArchive: async () => DAILY_REVIEW_ARCHIVE,
-        }}
-      />
-    );
-  },
-  play: async ({ canvasElement }) => {
-    const retry = await waitForStoryButton(
-      canvasElement,
-      (candidate) => candidate.textContent?.includes('重新生成') === true,
-    );
-    retry.click();
-    await waitForStoryText(canvasElement, '返回活动');
   },
 };

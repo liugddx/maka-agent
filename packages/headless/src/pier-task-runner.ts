@@ -32,6 +32,7 @@ import {
   trialExceptionSuffix,
   withProviderTelemetryArtifact,
   incompleteTerminalProviderRequest,
+  trialGradeSurvivingProviderOutage,
   modelForOpenCode,
   type HarborTaskPricing,
 } from './harbor-task-runner.js';
@@ -63,6 +64,7 @@ import {
   MAKA_NODE_TOOLCHAIN_CONTAINER_PATH,
   MAKA_NODE_TOOLCHAIN_FINGERPRINT,
 } from './maka-node-toolchain.js';
+import { buildAgentRepoMounts, CONTAINER_MAKA_REPO } from './agent-repo-mount.js';
 import {
   summarizeProviderTelemetry,
   startProviderAuthProxy,
@@ -74,7 +76,6 @@ import {
   type ProviderUpstreamCredentialResolver,
 } from './provider-auth-proxy.js';
 
-const CONTAINER_MAKA_REPO = '/opt/maka-agent';
 const TRIAL_CELL_OUTPUT = 'agent/maka-cell-output.json';
 const TRIAL_RUNTIME_EVENTS = 'agent/runtime-events.jsonl';
 const TRIAL_REWARD_JSON = 'verifier/reward.json';
@@ -251,7 +252,7 @@ export interface PierRunResult {
 
 export type PierProcessRunner = (request: PierRunRequest) => Promise<PierRunResult>;
 
-export type PierAgent = Exclude<HarnessAgentId, 'claude-code'>;
+export type PierAgent = Exclude<HarnessAgentId, 'claude-code' | 'reasonix'>;
 
 interface PierProviderRuntime {
   /** Proxy-minted secret env delivered via `--env-file` (kept off argv). */
@@ -532,6 +533,21 @@ export function createPierTaskRunner(options: PierTaskRunnerOptions): TaskRunner
               agent,
               harborTraceMode(attemptAgentEnv),
             );
+            // Same cross-runner contract as Harbor: a graded trial that never
+            // filed its cell output still carries the verifier's own verdict,
+            // because the self-report is not what scores a trial.
+            const harbor = trialGradeSurvivingProviderOutage(
+              grade.state === 'graded'
+                ? {
+                    reward: grade.reward,
+                    verifier: pierVerifierOutcome(
+                      grade.reward,
+                      await readVerifierDurationMs(join(trialDir, TRIAL_RESULT)),
+                    ),
+                  }
+                : undefined,
+              providerTelemetry,
+            );
             throw new FixedPromptBudgetExhaustedError(
               `agent budget exhausted for task ${input.task.id}`,
               // Carry the invalid-grade detail alongside the exhaustion cause so a
@@ -540,12 +556,11 @@ export function createPierTaskRunner(options: PierTaskRunnerOptions): TaskRunner
               grade.state === 'invalid'
                 ? `${formatTrialException(trialException)}; ${grade.detail}`
                 : formatTrialException(trialException),
-              artifactRefs || providerTelemetry.length > 0
-                ? {
-                    ...(artifactRefs ?? {}),
-                    ...(providerTelemetry.length > 0 ? { providerTelemetryPath } : {}),
-                  }
-                : undefined,
+              {
+                ...(artifactRefs ?? {}),
+                ...(harbor ? { harbor } : {}),
+                ...(providerTelemetry.length > 0 ? { providerTelemetryPath } : {}),
+              },
             );
           }
           completeTimedOutTrial = true;
@@ -563,7 +578,7 @@ export function createPierTaskRunner(options: PierTaskRunnerOptions): TaskRunner
       // last provider request is infra, never a graded model failure.
       const terminalProviderRequest = incompleteTerminalProviderRequest(
         providerTelemetry,
-        completeTimedOutTrial || verifierSettledTrial,
+        termination === null || completeTimedOutTrial || verifierSettledTrial,
       );
       if (terminalProviderRequest) {
         throw new PierInfraError(
@@ -701,7 +716,7 @@ function buildPierMounts(
   mode: 'cell' | 'task-run',
 ): Array<Record<string, unknown>> {
   const mounts: Array<Record<string, unknown>> = [
-    { type: 'bind', source: options.makaRepoPath, target: CONTAINER_MAKA_REPO, read_only: true },
+    ...buildAgentRepoMounts(agent, options.makaRepoPath),
   ];
   if (agent === 'maka' && mode === 'task-run') {
     if (!options.makaNodeToolchainPath) {

@@ -3,9 +3,18 @@ import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
 import { isModelExplicitlyUnsupportedForChat } from '@maka/core/model-catalog';
 import { thinkingVariantsForModel } from '@maka/core/model-thinking';
+import {
+  executionBoundaryDisplayMode,
+  type ExecutionBoundary,
+  type ExecutionBoundarySummary,
+} from '@maka/core/sandbox-boundary';
 import type { CreateSessionInput } from '@maka/core/runtime-inputs';
 import { DEFAULT_SESSION_NAME, normalizeUserSessionName } from '@maka/core/session-name';
-import { DEEP_RESEARCH_SESSION_LABEL, type SessionHeader } from '@maka/core/session';
+import {
+  isSessionStartModeLabel as isExecutionSemanticLabel,
+  sessionStartModeSpec,
+} from '@maka/core/explore-agent';
+import type { SessionHeader } from '@maka/core/session';
 import {
   isSessionNotFoundError,
   SessionMetadataConflictError,
@@ -40,6 +49,7 @@ import {
   type SessionConfigurationUpdateInput,
   type SessionCreateInput,
   type SessionCwdRelocateInput,
+  type SessionExecutionBoundaryQueryInput,
   type SessionMetadataUpdateInput,
   type SessionModelTarget,
   type SessionReadMarkerSetInput,
@@ -56,6 +66,7 @@ type SessionCatalogStores = Pick<
   | 'markSessionReadThroughMessage'
   | 'probeStableSessionCreate'
   | 'readCatalogRecord'
+  | 'readExecutionBoundary'
   | 'readHeaderRecordSnapshot'
   | 'updateHeaderVersioned'
 >;
@@ -111,6 +122,7 @@ export class HostSessionCatalogCoordinator {
     'session.configuration.update': (input) => this.#updateConfiguration(input),
     'session.cwd.relocate': (input) => this.#relocateCwd(input),
     'session.read_marker.set': (input) => this.#setReadMarker(input),
+    'session.execution_boundary.query': (input) => this.#queryExecutionBoundary(input),
   };
 
   readonly #stores: SessionCatalogStores;
@@ -173,6 +185,25 @@ export class HostSessionCatalogCoordinator {
     }
   }
 
+  async #queryExecutionBoundary(
+    input: SessionExecutionBoundaryQueryInput,
+  ): Promise<OperationOutcome<'session.execution_boundary.query'>> {
+    try {
+      return {
+        ok: true,
+        result: projectExecutionBoundary(await this.#stores.readExecutionBoundary(input.sessionId)),
+      };
+    } catch (error) {
+      if (isNotFound(error)) {
+        return executionBoundaryFailure('not_found', 'Session does not exist');
+      }
+      return executionBoundaryFailure(
+        'persistence_failed',
+        'Session execution boundary is unavailable',
+      );
+    }
+  }
+
   async #create(input: SessionCreateInput): Promise<OperationOutcome<'session.create'>> {
     let prepared: PreparedSessionCreate;
     try {
@@ -212,7 +243,7 @@ export class HostSessionCatalogCoordinator {
           llmConnectionSlug: model.connectionSlug,
           model: model.model,
           ...(input.thinkingLevel === undefined ? {} : { thinkingLevel: input.thinkingLevel }),
-          permissionMode: input.permissionMode ?? policy.policy.chatDefaults.permissionMode,
+          permissionMode: prepared.permissionMode ?? policy.policy.chatDefaults.permissionMode,
           collaborationMode: input.collaborationMode ?? 'agent',
           orchestrationMode: input.orchestrationMode ?? 'default',
         };
@@ -635,6 +666,7 @@ interface PreparedSessionCreate {
   readonly cwd: string;
   readonly name: string;
   readonly labels: readonly string[];
+  readonly permissionMode?: SessionCreateInput['permissionMode'];
   readonly requestFingerprint: string;
 }
 
@@ -648,9 +680,17 @@ async function prepareCreate(input: SessionCreateInput): Promise<PreparedSession
       'Session creation cannot set reserved execution labels',
     );
   }
+  const mode = input.mode === undefined ? undefined : sessionStartModeSpec(input.mode);
+  if (mode === undefined && input.permissionMode === 'explore') {
+    throw new SessionOperationFailure(
+      'invalid_request',
+      'Session creation requires a declared mode for explore permission',
+    );
+  }
   const cwd = await canonicalSessionDirectory(input.cwd);
-  const name = normalizedSessionName(input.name ?? DEFAULT_SESSION_NAME);
-  const labels = [...(input.labels ?? [])];
+  const name = normalizedSessionName(mode?.name ?? input.name ?? DEFAULT_SESSION_NAME);
+  const labels = [...(input.labels ?? []), ...(mode?.labels ?? [])];
+  const permissionMode = mode?.permissionMode ?? input.permissionMode;
   const identity = [
     'session.create.v1',
     input.sessionId,
@@ -662,7 +702,7 @@ async function prepareCreate(input: SessionCreateInput): Promise<PreparedSession
       ? ['default']
       : ['explicit', input.modelTarget.connectionSlug, input.modelTarget.model],
     input.thinkingLevel ?? null,
-    input.permissionMode ?? ['runtime_default'],
+    permissionMode ?? ['runtime_default'],
     input.collaborationMode ?? 'agent',
     input.orchestrationMode ?? 'default',
   ];
@@ -670,6 +710,7 @@ async function prepareCreate(input: SessionCreateInput): Promise<PreparedSession
     cwd,
     name,
     labels,
+    ...(permissionMode === undefined ? {} : { permissionMode }),
     requestFingerprint: `sha256:${createHash('sha256')
       .update(JSON.stringify(identity))
       .digest('hex')}`,
@@ -935,10 +976,6 @@ function normalizeSessionNamePatch(name: string): Pick<SessionHeader, 'name' | '
   return { name: normalizedSessionName(name), titleIsManual: true };
 }
 
-function isExecutionSemanticLabel(label: string): boolean {
-  return label === DEEP_RESEARCH_SESSION_LABEL;
-}
-
 function replaceUserOwnedLabels(
   currentLabels: readonly string[],
   requestedLabels: readonly string[],
@@ -1001,6 +1038,22 @@ function queryFailure(
   message: string,
 ): Extract<OperationOutcome<'session.catalog.query'>, { readonly ok: false }> {
   return { ok: false, error: { code, message } };
+}
+
+function executionBoundaryFailure(
+  code: OperationError<'session.execution_boundary.query'>['code'],
+  message: string,
+): Extract<OperationOutcome<'session.execution_boundary.query'>, { readonly ok: false }> {
+  return { ok: false, error: { code, message } };
+}
+
+function projectExecutionBoundary(boundary: ExecutionBoundary): ExecutionBoundarySummary {
+  if (boundary.kind !== 'managed') return { kind: boundary.kind, revision: boundary.revision };
+  return {
+    kind: 'managed',
+    access: executionBoundaryDisplayMode(boundary) === 'explore' ? 'read_only' : 'writable',
+    revision: boundary.revision,
+  };
 }
 
 function metadataFailure(

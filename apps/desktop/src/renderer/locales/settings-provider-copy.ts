@@ -8,7 +8,7 @@ type WidenCopy<T> = T extends string
 
 const zhCopy = {
   detail: {
-    delete: '删除', cancel: '取消', deleting: '删除中…', deleteUnused: '不再需要，删除连接',
+    delete: '删除', cancel: '取消', deleteUnused: '不再需要，删除连接',
     deleteFailed: '删除模型连接失败', credentialReadFailed: '读取模型凭据状态失败', refreshFailed: '刷新模型连接失败',
     saveFailed: '保存模型连接失败', saveModelsFailed: '保存启用模型失败',
     modelKey: '模型密钥', pasteModelKey: '粘贴模型密钥', getModelKey: '获取模型密钥', saving: '保存中…',
@@ -19,7 +19,7 @@ const zhCopy = {
     oauthWaitingDetail: '请到账号连接完成登录；登录成功后会自动出现在模型连接里。',
     credentialLoadingDetail: '正在读取模型凭据状态，读取完成前暂不测试连接或刷新模型。',
     credentialUnknownDetail: '模型凭据状态暂时没刷新成功，已避免把未知状态显示成未登录或未配置。',
-    testing: '测试中…', testConnection: '测试连接', updating: '更新中…',
+    testConnection: '测试连接',
     updateModels: '更新模型目录', endpoint: '服务地址',
     credentials: '连接', dangerZone: '删除连接', deleteRowHelp: '此操作不可撤销。',
     credentialsHelp: '密钥只保存在本机。',
@@ -33,7 +33,7 @@ const zhCopy = {
     disconnectAndDelete: '退出账号并删除',
     copilotImportFailed: '导入 GitHub Copilot 登录失败', copilotLoggedIn: 'GitHub Copilot 已登录', copilotWaiting: '等待兼容 GitHub 凭据',
     copilotLoggedInDetail: '若账号或组织策略变化，可重新导入兼容凭据。', copilotWaitingDetail: '配置具有 Copilot Requests 权限的凭据后从本机安全导入。',
-    importing: '导入中…', reimport: '重新导入', importCredential: '导入兼容凭据', login: '登录', loggingIn: '登录中…', relogin: '重新登录',
+    reimport: '重新导入', importCredential: '导入兼容凭据', login: '登录', loggingIn: '登录中…', relogin: '重新登录',
     oauthReloginDetail: '若请求提示需要重新登录，点这里重新走一遍授权。',
     oauthStartDetail: '点下方按钮打开浏览器完成登录，授权成功后会自动刷新这里的状态。',
     enabledModels: '启用的模型',
@@ -100,7 +100,7 @@ const zhCopy = {
     slug: '连接标识', name: '显示名称',
     accountIdPlaceholder: '填写账户 ID',
     saving: '保存中…', save: '保存供应商', keyRequired: (name: string) => `请填写 ${name} API Key`,
-    apiKeyLabel: (required: boolean) => `API Key（${required ? '必填' : '可选'}）`, accountIdLabel: 'Cloudflare Account ID（必填）', endpointLabel: (required: boolean) => `服务地址${required ? '（必填）' : ''}`,
+    apiKeyLabel: 'API Key', accountIdLabel: 'Cloudflare Account ID', endpointLabel: '服务地址',
     defaultModel: '默认模型', defaultModelPlaceholder: '填写你的中转站模型 ID，例如 gpt-4o、claude-sonnet-4-5 或自定义模型名', defaultModelHelp: '用于首次连接测试和模型选择器兜底；保存后仍会自动拉取模型目录。', defaultModelRequired: '请填写默认模型 ID。保存后仍会自动拉取模型目录。',
   },
   oauthFlow: {
@@ -151,7 +151,7 @@ export type ProviderSettingsCopy = WidenCopy<typeof zhCopy>;
 
 const enCopy: ProviderSettingsCopy = {
   detail: {
-    delete: 'Delete', cancel: 'Cancel', deleting: 'Deleting…', deleteUnused: 'Delete unused connection',
+    delete: 'Delete', cancel: 'Cancel', deleteUnused: 'Delete unused connection',
     deleteFailed: 'Failed to delete model connection', credentialReadFailed: 'Failed to read model credential status', refreshFailed: 'Failed to refresh model connection',
     saveFailed: 'Failed to save model connection', saveModelsFailed: 'Failed to save enabled models',
     modelKey: 'Model key', pasteModelKey: 'Paste model key', getModelKey: 'Get model key', saving: 'Saving…',
@@ -162,7 +162,7 @@ const enCopy: ProviderSettingsCopy = {
     oauthWaitingDetail: 'Complete sign-in under account connections. The model connection appears automatically afterward.',
     credentialLoadingDetail: 'Reading model credential status. Connection tests and model refresh are paused until it finishes.',
     credentialUnknownDetail: 'Model credential status could not be refreshed, so the connection is not being mislabeled as signed out or unconfigured.',
-    testing: 'Testing…', testConnection: 'Test connection', updating: 'Updating…',
+    testConnection: 'Test connection',
     updateModels: 'Update model catalog', endpoint: 'Service URL',
     credentials: 'Connection', dangerZone: 'Delete connection', deleteRowHelp: 'This cannot be undone.',
     credentialsHelp: 'The key stays on this machine.',
@@ -174,7 +174,7 @@ const enCopy: ProviderSettingsCopy = {
     disconnectAndDelete: 'Sign out and delete',
     copilotImportFailed: 'Failed to import GitHub Copilot sign-in', copilotLoggedIn: 'GitHub Copilot signed in', copilotWaiting: 'Waiting for compatible GitHub credentials',
     copilotLoggedInDetail: 'Reimport compatible credentials if the account or organization policy changes.', copilotWaitingDetail: 'Configure credentials with Copilot Requests permission, then import them securely from this device.',
-    importing: 'Importing…', reimport: 'Reimport', importCredential: 'Import compatible credentials', login: 'Sign in', loggingIn: 'Signing in…', relogin: 'Sign in again',
+    reimport: 'Reimport', importCredential: 'Import compatible credentials', login: 'Sign in', loggingIn: 'Signing in…', relogin: 'Sign in again',
     oauthReloginDetail: 'If a request asks you to sign in again, restart authorization here.',
     oauthStartDetail: 'Open the browser below to sign in. This status refreshes automatically after authorization.',
     enabledModels: 'Enabled models',
@@ -241,7 +241,7 @@ const enCopy: ProviderSettingsCopy = {
     slug: 'Connection identifier', name: 'Display name',
     accountIdPlaceholder: 'Enter account ID',
     saving: 'Saving…', save: 'Save provider', keyRequired: (name: string) => `Enter the ${name} API key`,
-    apiKeyLabel: (required: boolean) => `API key (${required ? 'required' : 'optional'})`, accountIdLabel: 'Cloudflare Account ID (required)', endpointLabel: (required: boolean) => `Service URL${required ? ' (required)' : ''}`,
+    apiKeyLabel: 'API key', accountIdLabel: 'Cloudflare Account ID', endpointLabel: 'Service URL',
     defaultModel: 'Default model', defaultModelPlaceholder: 'Enter your relay model id, e.g. gpt-4o, claude-sonnet-4-5, or a custom model name', defaultModelHelp: 'Used as the first connection-test and picker fallback; Maka still fetches the model catalog after saving.', defaultModelRequired: 'Enter a default model id. Maka still fetches the model catalog after saving.',
   },
   oauthFlow: {

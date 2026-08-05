@@ -23,6 +23,7 @@ describe('Session catalog protocol', () => {
             'session.configuration.update',
             'session.cwd.relocate',
             'session.read_marker.set',
+            'session.execution_boundary.query',
           ] as const
         ).map((operation) => [
           operation,
@@ -39,7 +40,56 @@ describe('Session catalog protocol', () => {
         'session.configuration.update': { mode: 'command', availability: 'ready' },
         'session.cwd.relocate': { mode: 'command', availability: 'ready' },
         'session.read_marker.set': { mode: 'command', availability: 'ready' },
+        'session.execution_boundary.query': { mode: 'query', availability: 'ready' },
       },
+    );
+  });
+
+  test('decodes only bounded execution boundary summaries', () => {
+    assert.deepEqual(
+      decodeClientFrame({
+        requestId: 'request-1',
+        operation: 'session.execution_boundary.query',
+        input: { sessionId: 'session-1' },
+      }),
+      {
+        requestId: 'request-1',
+        operation: 'session.execution_boundary.query',
+        input: { sessionId: 'session-1' },
+      },
+    );
+    assert.deepEqual(
+      decodeHostFrame({
+        requestId: 'request-1',
+        operation: 'session.execution_boundary.query',
+        ok: true,
+        result: { kind: 'managed', access: 'read_only', revision: 3 },
+      }),
+      {
+        requestId: 'request-1',
+        operation: 'session.execution_boundary.query',
+        ok: true,
+        result: { kind: 'managed', access: 'read_only', revision: 3 },
+      },
+    );
+    assert.throws(
+      () =>
+        decodeHostFrame({
+          requestId: 'request-1',
+          operation: 'session.execution_boundary.query',
+          ok: true,
+          result: { kind: 'managed', access: 'read_only', revision: 3, profile: {} },
+        }),
+      isProtocolError,
+    );
+    assert.throws(
+      () =>
+        decodeClientFrame({
+          requestId: 'request-1',
+          operation: 'session.execution_boundary.query',
+          input: { sessionId: 'session-1', includeProfile: true },
+        }),
+      isProtocolError,
     );
   });
 
@@ -214,6 +264,37 @@ describe('Session catalog protocol', () => {
             sessionId: 'session-name-overflow',
             cwd: '/workspace',
             name: '🦊'.repeat(81),
+            modelTarget: { kind: 'default' },
+          },
+        }),
+      isProtocolError,
+    );
+  });
+
+  test('accepts only declared Session start modes', () => {
+    const decoded = decodeClientFrame({
+      requestId: 'request-mode',
+      operation: 'session.create',
+      input: {
+        sessionId: 'session-mode',
+        cwd: '/workspace',
+        mode: 'deep_research',
+        modelTarget: { kind: 'default' },
+      },
+    });
+    if ('kind' in decoded || decoded.operation !== 'session.create') {
+      assert.fail('Expected Session create frame');
+    }
+    assert.equal(decoded.input.mode, 'deep_research');
+    assert.throws(
+      () =>
+        decodeClientFrame({
+          requestId: 'request-invalid-mode',
+          operation: 'session.create',
+          input: {
+            sessionId: 'session-invalid-mode',
+            cwd: '/workspace',
+            mode: 'unknown',
             modelTarget: { kind: 'default' },
           },
         }),

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepResearchSession } from '@maka/core/session';
 import { filterModelVisibleTaskLedgerTasks } from '@maka/core/task-ledger';
 import {
   AgentGraphCoordinator,
@@ -15,9 +16,11 @@ import {
   isBuiltinFilesystemWorkerSandboxAvailable,
   prepareSkillInvocationMessageFromInventory,
   RuntimeReadModel,
+  routeWebSearchTools,
   SessionManager,
   SessionActivityRegistry,
   ShellRunProcessManager,
+  type MakaTool,
   type RuntimeHostedRootAuthority,
 } from '@maka/runtime';
 import { createAgentGraphControlStore } from '@maka/storage/agent-graph-control-store';
@@ -26,6 +29,8 @@ import {
   openInteractiveArtifactStoreForWrite,
 } from '@maka/storage/artifact-stores';
 import { openInteractiveAutomationAuthorityForWrite } from '@maka/storage/automation-authority';
+import { openInteractiveDeepResearchStoreForWrite } from '@maka/storage/deep-research-authority';
+import { openInteractiveDailyReviewAuthorityForWrite } from '@maka/storage/daily-review-authority';
 import { openInteractivePlanStoreForWrite } from '@maka/storage/plan-authority';
 import {
   isSessionNotFoundError,
@@ -55,12 +60,15 @@ import { HostAutomationCoordinator } from './automation-coordinator.js';
 import { recoverClientCapabilityOutcomes } from './client-capability-recovery.js';
 import { HostConnectionEffectCoordinator } from './connection-effect-coordinator.js';
 import { HostClientCapabilityCoordinator } from './client-capability-coordinator.js';
+import { HostDeepResearchCoordinator } from './deep-research-coordinator.js';
+import { HostDailyReviewCoordinator } from './daily-review-coordinator.js';
 import {
   createHostAiSdkBackend,
   createHostExecutionModelComposition,
 } from './execution-model-composition.js';
 import {
   createHostGoalEvaluator,
+  createHostDailyReviewModel,
   createHostSessionEffectModel,
 } from './execution-model-authority.js';
 import { HostExecutionInspectCoordinator } from './execution-inspect-coordinator.js';
@@ -85,6 +93,7 @@ import { HostSessionRetirementCoordinator } from './session-retirement-coordinat
 import { HostSessionRevisionCoordinator } from './session-revision-coordinator.js';
 import { HostSessionEffectCoordinator } from './session-effect-coordinator.js';
 import { SessionContinuityCoordinator } from './session-continuity-coordinator.js';
+import { createSessionTranscriptReader } from './session-transcript-reader.js';
 import { HostSkillCatalogCoordinator } from './skill-catalog-coordinator.js';
 import { SkillCatalogRepository } from './skill-catalog-repository.js';
 import { HostTaskLedgerCoordinator } from './task-ledger-coordinator.js';
@@ -108,8 +117,15 @@ export async function createExecutionRuntimeHostComposition(
     | Awaited<ReturnType<typeof openInteractiveAutomationAuthorityForWrite>>
     | undefined;
   let planStore: Awaited<ReturnType<typeof openInteractivePlanStoreForWrite>> | undefined;
+  let deepResearchStore:
+    | Awaited<ReturnType<typeof openInteractiveDeepResearchStoreForWrite>>
+    | undefined;
+  let dailyReviewStore:
+    | Awaited<ReturnType<typeof openInteractiveDailyReviewAuthorityForWrite>>
+    | undefined;
   let graphClient: HostAgentGraphCoordinator | undefined;
   let sessionEffects: HostSessionEffectCoordinator | undefined;
+  let unsubscribeTaskLedger: (() => void) | undefined;
   try {
     const runtimePolicyStores = await openInteractiveRuntimePolicyStoresForWrite(
       context.owner.lease,
@@ -121,6 +137,14 @@ export async function createExecutionRuntimeHostComposition(
     automationStore = openedAutomationStore;
     const openedPlanStore = await openInteractivePlanStoreForWrite(context.owner.lease);
     planStore = openedPlanStore;
+    const openedDeepResearchStore = await openInteractiveDeepResearchStoreForWrite(
+      context.owner.lease,
+    );
+    deepResearchStore = openedDeepResearchStore;
+    const openedDailyReviewStore = await openInteractiveDailyReviewAuthorityForWrite(
+      context.owner.lease,
+    );
+    dailyReviewStore = openedDailyReviewStore;
     const memoryStore = await openInteractiveMemoryBundleStoreForWrite(context.owner.lease);
     longTermMemoryStore = await openInteractiveLongTermMemoryStoreForWrite(context.owner.lease);
     taskLedgerStore = await openInteractiveTaskLedgerStoreForWrite(context.owner.lease);
@@ -175,11 +199,15 @@ export async function createExecutionRuntimeHostComposition(
       sessions: {
         listShellRunUpdates: (sessionId) =>
           requireSessionManager(manager).listShellRunUpdates(sessionId),
+        getShellRunUpdate: (sessionId, ref) =>
+          requireSessionManager(manager).getShellRunUpdate(sessionId, ref),
       },
       sessionHeaders: stores.sessionStore,
       sessionAdmission,
       acquireResidency: context.acquireResidency,
       requestDrain: context.requestDrain,
+      onProjectionChanged: (update) =>
+        requireContinuity(continuity).enqueueRuntimeResourceChanged(update),
     });
     const executionArtifacts = createHostExecutionArtifactServices({
       artifacts: openedArtifactStore,
@@ -195,7 +223,11 @@ export async function createExecutionRuntimeHostComposition(
       ...(sandboxManager ? { sandboxManager } : {}),
       ...(filesystemWorker ? { filesystemWorker } : {}),
     };
-    const hostTools = [createHostWebSearchTool({ policy: runtimePolicyStores.operations })];
+    const hostTools = [
+      createHostWebSearchTool({
+        policy: runtimePolicyStores.operations,
+      }),
+    ];
     const childAgentTools = createHostChildAgentToolComposition({
       taskLedger,
       builtinTools,
@@ -220,6 +252,8 @@ export async function createExecutionRuntimeHostComposition(
     let oauth: HostOAuthCoordinator | undefined;
     let automations: HostAutomationCoordinator | undefined;
     let goal: HostGoalCoordinator | undefined;
+    let deepResearch: HostDeepResearchCoordinator | undefined;
+    let dailyReview: HostDailyReviewCoordinator | undefined;
     const rootPort: HostMessageRootPort = {
       readSessionHeader: (sessionId) =>
         requireRootCoordinator(rootCoordinator).readSessionHeader(sessionId),
@@ -258,13 +292,43 @@ export async function createExecutionRuntimeHostComposition(
       readGoal: (sessionId) => requireGoal(goal).readProjection(sessionId),
     });
     canonicalProjection = canonicalProjectionReader;
+    const canonicalPermissionOutcomes = new HostCanonicalPermissionOutcomeReader({
+      store: stores.interactionStore,
+    });
     continuity = new SessionContinuityCoordinator(
       context.hostEpoch,
       (sessionId) => canonicalProjectionReader.read(sessionId),
       sessionAdmission,
       context.requestDrain,
+      createSessionTranscriptReader({ stores, canonicalPermissionOutcomes }),
     );
     const continuityCoordinator = continuity;
+    unsubscribeTaskLedger = taskLedger.subscribe(({ sessionId }) =>
+      continuityCoordinator.enqueueSessionDomainChanged(sessionId, 'task'),
+    );
+    deepResearch = new HostDeepResearchCoordinator({
+      store: openedDeepResearchStore,
+      artifacts: openedArtifactStore,
+      sessions: stores.sessionStore,
+      sessionAdmission,
+      onProjectionChanged: (sessionId) =>
+        continuityCoordinator.enqueueSessionDomainChanged(sessionId, 'deep_research'),
+    });
+    dailyReview = new HostDailyReviewCoordinator({
+      store: openedDailyReviewStore,
+      usage: openedUsageStores,
+      sessions: stores.sessionStore,
+      readRunEvents: (sessionId, runId) => stores.agentRunStore.readEvents(sessionId, runId),
+      model: createHostDailyReviewModel({
+        runtimePolicy: runtimePolicyStores,
+        oauthCredentials,
+        claudeDeviceId: context.owner.capability.rootId,
+        usage: openedUsageStores,
+        requestDrain: context.requestDrain,
+      }),
+      acquireResidency: context.acquireResidency,
+      requestDrain: context.requestDrain,
+    });
     let poisonFailure: Error | undefined;
     let draining = false;
     let recoveryTask: Promise<void> | undefined;
@@ -279,6 +343,7 @@ export async function createExecutionRuntimeHostComposition(
       rootCoordinator?.beginDrain();
       runtimeResources?.beginDrain();
       automations?.beginDrain();
+      dailyReview?.beginDrain();
       messages.beginDrain();
       interactions.beginDrain();
       connectionEffects.beginDrain();
@@ -311,9 +376,6 @@ export async function createExecutionRuntimeHostComposition(
           requireGraphSupervisorWake(graphSupervisorWake).notifyPermissionResponse(rootSessionId),
         ),
     });
-    const canonicalPermissionOutcomes = new HostCanonicalPermissionOutcomeReader({
-      store: stores.interactionStore,
-    });
     memory = new HostMemoryCoordinator({
       store: memoryStore,
       runtimePolicyStores,
@@ -335,12 +397,17 @@ export async function createExecutionRuntimeHostComposition(
         clientCapabilities: requireClientCapabilities(clientCapabilities),
         automationTool: requireAutomationCoordinator(automations).modelTool,
         planStore: openedPlanStore,
+        deepResearchTools: requireDeepResearch(deepResearch).toolsForSession(
+          backendContext.sessionId,
+        ),
         goalTools: requireGoal(goal).tools,
         builtinTools,
         hostTools,
         resolveRootTools: (sessionId) =>
           requireGraphCoordinator(graphCoordinator).toolsForSession(sessionId),
         parentAgentTools: childAgentTools.parentTools,
+        childTools: childAgentTools.childTools,
+        worktreePatchWriteBackAvailable: true,
         childAgents: bindHostChildAgentBackend(
           requireSessionManager(manager),
           backendContext.sessionId,
@@ -383,6 +450,13 @@ export async function createExecutionRuntimeHostComposition(
             state: planState,
             mode: header.collaborationMode ?? 'agent',
           },
+          ...(isDeepResearchSession(header.labels)
+            ? {
+                deepResearch: {
+                  tools: requireDeepResearch(deepResearch).toolsForSession(sessionId),
+                },
+              }
+            : {}),
         }).tools.map((tool) => tool.name);
       } finally {
         capabilitySnapshot?.release();
@@ -410,6 +484,28 @@ export async function createExecutionRuntimeHostComposition(
       requestDrain: context.requestDrain,
     });
     sessionEffects = sessionEffectCoordinator;
+    const resolveChildTools = async (sessionId: string): Promise<readonly MakaTool[]> => {
+      const header = await stores.sessionStore.readHeader(sessionId);
+      const [resolved, snapshot] = await Promise.all([
+        runtimePolicyStores.operations.resolveExecutionConnection(header.llmConnectionSlug),
+        runtimePolicyStores.runtimePolicy.getSnapshot(),
+      ]);
+      if (resolved.kind !== 'ready') {
+        return childAgentTools.childTools.filter((tool) => tool.name !== 'WebSearch');
+      }
+      const { models, ...connection } = resolved.connection;
+      return routeWebSearchTools({
+        tools: childAgentTools.childTools,
+        settings: snapshot.policy.webSearch,
+        connection: {
+          ...connection,
+          defaultModel: header.model,
+          ...(models ? { models: [...models] } : {}),
+        },
+        model: header.model,
+        privacy: snapshot.policy.privacy,
+      });
+    };
     manager = new SessionManager({
       store: stores.sessionStore,
       runStore: stores.agentRunStore,
@@ -465,6 +561,7 @@ export async function createExecutionRuntimeHostComposition(
       shellRuns,
       planStore: openedPlanStore,
       childTools: childAgentTools.childTools,
+      resolveChildTools,
       worktreeChildExecutor,
       listArtifactsForTurn: (sessionId, turnId) =>
         openedArtifactStore.listTurnArtifacts(sessionId, turnId),
@@ -686,7 +783,10 @@ export async function createExecutionRuntimeHostComposition(
       isSessionActive: (sessionId) => coordinator.readRootState(sessionId).kind !== 'idle',
       refreshContinuity: (sessionId, lease) =>
         continuityCoordinator.refreshCanonical(sessionId, lease),
+      onProjectionChanged: (sessionId) =>
+        continuityCoordinator.enqueueSessionDomainChanged(sessionId, 'plan'),
       requestDrain: context.requestDrain,
+      root: coordinator,
     });
     const executionInspect = new HostExecutionInspectCoordinator(stores);
     const sessionRevisions = new HostSessionRevisionCoordinator({
@@ -720,6 +820,7 @@ export async function createExecutionRuntimeHostComposition(
       purgeOperationalState: async (sessionId) => {
         await stores.purgeConversationOperationalState(sessionId);
         await openedPlanStore.purgeSessionState(sessionId);
+        await openedDeepResearchStore.purgeSessionState(sessionId);
       },
       purgeAgentGraphState: async (sessionId) => {
         await openedGraphControlStore.purgeAgentGraphControlState(
@@ -753,6 +854,8 @@ export async function createExecutionRuntimeHostComposition(
       ...runtimeResources.handlers,
       ...automations.handlers,
       ...plans.handlers,
+      ...requireDeepResearch(deepResearch).handlers,
+      ...requireDailyReview(dailyReview).handlers,
     } satisfies DomainOperationHandlerMap;
     const recover = () => {
       recoveryTask ??= (async () => {
@@ -788,6 +891,7 @@ export async function createExecutionRuntimeHostComposition(
         await requireGraphSupervisorWake(graphSupervisorWake).recover();
         await requireGraphCoordinator(graphCoordinator).recover();
         await requireAutomationCoordinator(automations).recover();
+        await requireDailyReview(dailyReview).recover();
         requireAutomationCoordinator(automations).start();
       })();
       return recoveryTask;
@@ -840,12 +944,22 @@ export async function createExecutionRuntimeHostComposition(
           errors.push(error);
         }
         try {
+          await dailyReview?.close();
+        } catch (error) {
+          errors.push(error);
+        }
+        try {
           await runtimeResources?.close();
         } catch (error) {
           errors.push(error);
         }
         try {
           await sessionEffects?.close();
+        } catch (error) {
+          errors.push(error);
+        }
+        try {
+          deepResearch?.close();
         } catch (error) {
           errors.push(error);
         }
@@ -917,6 +1031,7 @@ export async function createExecutionRuntimeHostComposition(
           errors.push(error);
         }
         try {
+          unsubscribeTaskLedger?.();
           taskLedgerStore?.close();
         } catch (error) {
           errors.push(error);
@@ -933,6 +1048,11 @@ export async function createExecutionRuntimeHostComposition(
         }
         try {
           openedPlanStore.close();
+        } catch (error) {
+          errors.push(error);
+        }
+        try {
+          openedDeepResearchStore.close();
         } catch (error) {
           errors.push(error);
         }
@@ -970,6 +1090,16 @@ export async function createExecutionRuntimeHostComposition(
       errors.push(closeError);
     }
     try {
+      dailyReviewStore?.close();
+    } catch (closeError) {
+      errors.push(closeError);
+    }
+    try {
+      deepResearchStore?.close();
+    } catch (closeError) {
+      errors.push(closeError);
+    }
+    try {
       graphClient?.close();
     } catch (closeError) {
       errors.push(closeError);
@@ -990,6 +1120,7 @@ export async function createExecutionRuntimeHostComposition(
       errors.push(closeError);
     }
     try {
+      unsubscribeTaskLedger?.();
       taskLedgerStore?.close();
     } catch (closeError) {
       errors.push(closeError);
@@ -1070,6 +1201,20 @@ function requireAutomationCoordinator(
   coordinator: HostAutomationCoordinator | undefined,
 ): HostAutomationCoordinator {
   if (!coordinator) throw new Error('Runtime Host Automation coordinator is not composed');
+  return coordinator;
+}
+
+function requireDeepResearch(
+  coordinator: HostDeepResearchCoordinator | undefined,
+): HostDeepResearchCoordinator {
+  if (!coordinator) throw new Error('Runtime Host Deep Research coordinator is not composed');
+  return coordinator;
+}
+
+function requireDailyReview(
+  coordinator: HostDailyReviewCoordinator | undefined,
+): HostDailyReviewCoordinator {
+  if (!coordinator) throw new Error('Runtime Host Daily Review coordinator is not composed');
   return coordinator;
 }
 

@@ -47,6 +47,8 @@ import {
   BotRegistry,
   ShellRunProcessManager,
   SessionActivityRegistry,
+  buildParentAgentTools,
+  listRunnableBuiltinAgentDefinitions,
   listInvocableSkills,
   prepareSkillInvocationMessage,
   resolveSkillDiscoveryPaths,
@@ -57,6 +59,7 @@ import type {
   GoalTurnOutcome,
   HostCapabilities,
   HostCapabilitiesResolver,
+  MakaTool,
 } from '@maka/runtime';
 import type { LlmConnection } from '@maka/core/llm-connections';
 import {
@@ -74,6 +77,7 @@ import {
   createMcpConfigStore,
   createSqliteModelCallLedger,
   createSqliteTelemetryRepo,
+  resetIncompatibleOperationalStateDatabase,
 } from '@maka/storage';
 import { createAgentGraphControlStore } from '@maka/storage/agent-graph-control-store';
 import { resolveWorkspaceIdentity } from '@maka/storage/workspace-identity';
@@ -88,6 +92,7 @@ import { assertDesktopExecutionBoundary } from './desktop-execution-admission.js
 import { createFileCredentialStore } from './credential-store.js';
 import { bindOnboardingDeps, createOnboardingService } from './onboarding-service.js';
 import { createDailyReviewArchiveStore } from './daily-review-archive-store.js';
+import { projectEmbeddedDeepResearch } from './deep-research-desktop-projection.js';
 import { resolveE2eFixture, seedE2eFixture } from './e2e-fixture.js';
 import { resolveBuildInfo } from './build-info.js';
 import { resolveShellEnv } from './shell-env.js';
@@ -119,10 +124,13 @@ import { registerUsageIpc } from './usage-ipc-main.js';
 import { registerWebSearchIpc } from './web-search-ipc-main.js';
 import { registerNotificationsIpc } from './notifications-ipc-main.js';
 import { registerAppIpc } from './app-ipc-main.js';
+import { createAppUpdateService } from './app-update-service.js';
+import { hasInterruptibleUpdateWork } from './app-update-activity.js';
 import { registerGitIpc } from './git-ipc-main.js';
 import { registerWorkspaceSearchIpc } from './workspace-search-ipc-main.js';
 import { registerOnboardingIpc } from './onboarding-ipc-main.js';
 import { registerPermissionsIpc } from './permissions-ipc-main.js';
+import { ensureBundledSkillInstalled } from './skills.js';
 import {
   createPermissionOverlayMain,
   registerPermissionOverlayIpc,
@@ -135,6 +143,7 @@ import { createSettingsRuntimeEffects } from './settings-runtime-effects.js';
 import { createAiSdkBackendFactory, createSessionStreamer } from './session-stream.js';
 import {
   resolveDesktopBackendToolSurface,
+  resolveDesktopChildToolSurface,
   resolveDesktopNewSessionSkillHost,
   resolveDesktopSessionSkillHost,
 } from './desktop-backend-tool-surface.js';
@@ -214,6 +223,10 @@ if (e2eFixture) {
     app.exit(0);
     await new Promise<never>(() => {});
   }
+}
+
+if (resetIncompatibleOperationalStateDatabase(workspaceRoot)) {
+  console.warn('[startup] cleared incompatible operational state');
 }
 
 async function confirmDesktopStorageRootRepair(): Promise<boolean> {
@@ -642,6 +655,11 @@ function focusOrCreateMainWindow(signal: AbortSignal): void {
   }
 }
 const safeSendToRenderer = mainWindowController.send;
+const updateMockState = process.env.MAKA_UPDATE_MOCK_STATE === 'available' ||
+  process.env.MAKA_UPDATE_MOCK_STATE === 'downloading' ||
+  process.env.MAKA_UPDATE_MOCK_STATE === 'downloaded'
+  ? process.env.MAKA_UPDATE_MOCK_STATE
+  : undefined;
 taskLedgerStore.subscribe((event) => safeSendToRenderer('tasks:changed', event));
 deepResearchStore.subscribe((event) => safeSendToRenderer('deepResearch:changed', event));
 const deepResearchTools = buildDeepResearchTools({
@@ -657,6 +675,19 @@ const shellRuns = new ShellRunProcessManager({
   onShellRunUpdate: (update) => {
     safeSendToRenderer('shell-runs:update', update);
   },
+});
+const updateService = createAppUpdateService({
+  currentVersion: app.getVersion(),
+  isPackaged: app.isPackaged,
+  openExternal: (url) => shell.openExternal(url),
+  mockLatestVersion: process.env.MAKA_UPDATE_MOCK_VERSION,
+  mockState: updateMockState,
+  onStatusChange: (status) => safeSendToRenderer('app:updateStatusChanged', status),
+  hasActiveTasks: () => hasInterruptibleUpdateWork({
+    sessionActivities,
+    automationScheduler: automationWiring.scheduler,
+    shellRuns,
+  }),
 });
 const {
   persistToolArtifacts,
@@ -699,6 +730,17 @@ const {
   getWorkspacePrivacyContext,
   resolveDesktopSkillHost,
 });
+if (computerUse.backendId !== 'none') {
+  const seededComputerUseSkill = await startupStep(
+    'Computer Use skill',
+    ensureBundledSkillInstalled(workspaceRoot, 'computer-use'),
+  );
+  if (!seededComputerUseSkill.ok) {
+    console.warn(
+      `[skills] Computer Use is available, but its bundled Skill was not installed: ${seededComputerUseSkill.reason}`,
+    );
+  }
+}
 let agentGraphCoordinator: AgentGraphCoordinator;
 let agentGraphSupervisorWakeCoordinator: AgentGraphSupervisorWakeCoordinator;
 const desktopBackendToolSurfaceDeps = {
@@ -711,9 +753,28 @@ const desktopBackendToolSurfaceDeps = {
   builtinTools,
   toolEconomy: desktopProductToolSurface.identity.policy.economy,
   planStore,
+  getWebSearchSettings: async () => (await settingsStore.get()).webSearch,
+  getPrivacySettings: async () => (await settingsStore.get()).privacy,
+  childTools: childAgentTools,
+  buildParentAgentToolsForChildSurface: (tools: readonly MakaTool[]) =>
+    buildParentAgentTools({
+      taskLedger: taskLedgerStore,
+      definitions: listRunnableBuiltinAgentDefinitions({
+        tools,
+        worktreeChildExecutorAvailable: worktreeChildExecutor !== undefined,
+      }),
+    }),
   getAgentGraphSupervisorTools: (sessionId: string) =>
     agentGraphCoordinator.toolsForSession(sessionId),
 };
+
+async function resolveDesktopChildTools(sessionId: string) {
+  const header = await store.readHeader(sessionId);
+  return resolveDesktopChildToolSurface(desktopBackendToolSurfaceDeps, {
+    header,
+    tools: childAgentTools,
+  });
+}
 // Cursor-overlay teardown assigns a module-scoped `let`, so it stays in boot.ts.
 onMainWindowClose = () => {
   computerUseOverlay.destroyAll();
@@ -877,6 +938,7 @@ const runtime = new SessionManager({
   shellRuns,
   backends,
   childTools: childAgentTools,
+  resolveChildTools: resolveDesktopChildTools,
   subagentCatalog,
   worktreeChildExecutor,
   safeBoundaryResumeEnabled: process.env.MAKA_RUNTIME_SAFE_BOUNDARY_RESUME === '1',
@@ -1048,8 +1110,8 @@ const onboardingService = createOnboardingService(
 
 function registerIpc(): void {
   const currentProjectRoot = resolveCurrentProjectRoot;
-  ipcMain.handle('deepResearch:get', (_event, sessionId: string) =>
-    deepResearchStore.read(sessionId));
+  ipcMain.handle('deepResearch:get', async (_event, sessionId: string) =>
+    projectEmbeddedDeepResearch(await deepResearchStore.read(sessionId)));
   registerMcpIpcMain({
     ipcMain,
     store: mcpConfigStore,
@@ -1068,6 +1130,7 @@ function registerIpc(): void {
     buildInfo,
     e2eFixture,
     projectManagement,
+    updateService,
   });
   registerMemoryIpc({ localMemory });
   registerConfigIpc({ connectionStore, settingsStore, credentialStore, workspaceRoot });
@@ -1453,6 +1516,7 @@ wireAppLifecycle({
   botRegistry,
   planReminders,
   dailyReview,
+  updateService,
   automationWiring,
   goalWiring,
   computerUse,

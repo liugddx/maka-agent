@@ -6,7 +6,6 @@ import {
   isCollaborationMode,
   isOrchestrationMode,
   isPermissionMode,
-  revisionFamilySessionIds,
   isThinkingLevel,
   sanitizeTaskLedgerTask,
   thinkingVariantsForModel,
@@ -57,6 +56,8 @@ import type { DesktopCreateSessionInput } from './new-session-project.js';
 import { registerSessionExecutionIpc } from './session-execution-ipc-main.js';
 import { createQuoteCompanionCleanupAuthority } from './quote-companion-cleanup.js';
 import { mergeSentInlineReferences } from './session-send-inline-references.js';
+import { resolveSessionActionIds } from './session-family-action.js';
+import { normalizeSessionModelSelection } from './session-model-input.js';
 
 type SessionStore = ReturnType<typeof createSessionStore>;
 type MainWindowController = ReturnType<typeof createMainWindowController>;
@@ -155,22 +156,6 @@ function latestStoredMessageTs(messages: readonly StoredMessage[]): number | und
   return latest;
 }
 
-function normalizeSessionModelSelection(input: unknown): { llmConnectionSlug: string; model: string } {
-  if (!input || typeof input !== 'object') {
-    throw new Error('Invalid model selection');
-  }
-  const record = input as Record<string, unknown>;
-  const llmConnectionSlug = typeof record.llmConnectionSlug === 'string' ? record.llmConnectionSlug.trim() : '';
-  const model = typeof record.model === 'string' ? record.model.trim() : '';
-  if (!llmConnectionSlug) {
-    throw new Error('Missing model connection');
-  }
-  if (!model) {
-    throw new Error('Missing model');
-  }
-  return { llmConnectionSlug, model };
-}
-
 function normalizeSupportedSessionThinkingLevel(
   input: unknown,
   providerType: ProviderType,
@@ -185,26 +170,6 @@ function normalizeSupportedSessionThinkingLevel(
     throw new Error(`当前模型不支持思考级别：${thinkingLevel}`);
   }
   return thinkingLevel;
-}
-
-function requestsRevisionFamily(options: unknown): boolean {
-  if (options === undefined) return false;
-  if (!options || typeof options !== 'object' || Array.isArray(options)) {
-    throw new Error('Invalid session family action options');
-  }
-  const value = (options as { revisionFamily?: unknown }).revisionFamily;
-  if (value === undefined) return false;
-  if (typeof value !== 'boolean') throw new Error('Invalid revisionFamily option');
-  return value;
-}
-
-async function resolveSessionActionIds(
-  runtime: SessionManager,
-  sessionId: string,
-  options: unknown,
-): Promise<string[]> {
-  if (!requestsRevisionFamily(options)) return [sessionId];
-  return revisionFamilySessionIds(await runtime.listSessions(), sessionId);
 }
 
 export function registerSessionsIpc(
@@ -353,6 +318,11 @@ export function registerSessionsIpc(
     }
     return messages;
   });
+  // The Runtime Host candidate uses these channels to bind renderer listeners
+  // to one atomic transcript/live subscription. Embedded execution already
+  // owns its stream lifetime, so its implementation is intentionally a no-op.
+  ipcMain.handle('sessions:observe', () => undefined);
+  ipcMain.handle('sessions:unobserve', () => undefined);
   ipcMain.handle('sessions:listTurns', (_event, sessionId: string) => runtime.listTurns(sessionId));
   // Goal kill-switch surface: the renderer reads the active goal to badge a
   // session running an autonomous loop, and clears it to stop the loop. `get`
@@ -432,13 +402,17 @@ export function registerSessionsIpc(
   ipcMain.handle('sessions:readExecutionBoundary', (_event, sessionId: string) =>
     runtime.readExecutionBoundary(sessionId),
   );
-  ipcMain.handle('sessions:listActiveSandboxBoundaryRequests', (_event, sessionId: string) => {
+  ipcMain.handle('sessions:listActiveInteractions', async (_event, sessionId: string) => {
     // Already filtered by retirement: `getE2eFixtureState` is the one owner of
     // which fixture requests are still unanswered.
     const fixtureRequest = getE2eFixtureState(e2eFixture)?.sandboxBoundaryBySession?.[sessionId];
-    return fixtureRequest
-      ? [fixtureRequest]
-      : runtime.listActiveSandboxBoundaryRequests(sessionId);
+    // Concatenate rather than choose: the read-back is authoritative for the
+    // whole queue now, so shadowing the runtime's list behind a fixture
+    // request would drop a real unanswered one.
+    return [
+      ...(fixtureRequest ? [fixtureRequest] : []),
+      ...(await runtime.listActiveInteractions(sessionId)),
+    ];
   });
   ipcMain.handle('sessions:respondToSandboxBoundary', async (_event, sessionId: string, response) => {
     const normalized = normalizeSandboxBoundaryResponse(response);
@@ -611,7 +585,7 @@ export function registerSessionsIpc(
     });
   });
   ipcMain.handle('sessions:archive', async (_event, sessionId: string, options?: unknown) => {
-    for (const id of await resolveSessionActionIds(runtime, sessionId, options)) {
+    for (const id of await resolveSessionActionIds(() => runtime.listSessions(), sessionId, options)) {
       computerUseOverlay.clearForSession(id);
       computerUsePip?.clearForSession(id);
       computerUseScreenLock?.clearForSession(id);
@@ -627,7 +601,7 @@ export function registerSessionsIpc(
     }
   });
   ipcMain.handle('sessions:unarchive', async (_event, sessionId: string, options?: unknown) => {
-    for (const id of await resolveSessionActionIds(runtime, sessionId, options)) {
+    for (const id of await resolveSessionActionIds(() => runtime.listSessions(), sessionId, options)) {
       await goalWiring.unarchiveSession(id, () => runtime.unarchive(id));
       emitSessionsChanged('updated', id);
     }
@@ -638,7 +612,7 @@ export function registerSessionsIpc(
     isFlagged: boolean,
     options?: unknown,
   ) => {
-    for (const id of await resolveSessionActionIds(runtime, sessionId, options)) {
+    for (const id of await resolveSessionActionIds(() => runtime.listSessions(), sessionId, options)) {
       await runtime.setFlagged(id, isFlagged);
       emitSessionsChanged('pinned', id);
     }
@@ -649,7 +623,7 @@ export function registerSessionsIpc(
     name: string,
     options?: unknown,
   ) => {
-    for (const id of await resolveSessionActionIds(runtime, sessionId, options)) {
+    for (const id of await resolveSessionActionIds(() => runtime.listSessions(), sessionId, options)) {
       await runtime.renameSession(id, name);
       emitSessionsChanged('renamed', id);
     }
@@ -754,7 +728,7 @@ export function registerSessionsIpc(
     return next;
   });
   ipcMain.handle('sessions:remove', async (_event, sessionId: string, options?: unknown) => {
-    for (const id of await resolveSessionActionIds(runtime, sessionId, options)) {
+    for (const id of await resolveSessionActionIds(() => runtime.listSessions(), sessionId, options)) {
       await removeSession(id);
     }
   });

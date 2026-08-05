@@ -16,6 +16,11 @@ export {
 } from './session-manager.js';
 export { RuntimeContextCompactError } from './runtime-kernel.js';
 export type { ModelMessage, JSONValue } from './model-protocol.js';
+export {
+  buildNativeWebSearchTool,
+  NATIVE_WEB_SEARCH_TOOL_NAME,
+  routeWebSearchTools,
+} from './native-web-search-tool.js';
 export type {
   CompactSessionInput,
   PlanSafeBoundaryContinuationInput,
@@ -797,6 +802,7 @@ export {
   DEEP_RESEARCH_STATUS_TOOL_NAME,
   DEEP_RESEARCH_UPDATE_CHECKLIST_TOOL_NAME,
   buildDeepResearchTools,
+  isDeepResearchToolAllowed,
   renderDeepResearchRunStatus,
 } from './deep-research-tools.js';
 export type {
@@ -1272,6 +1278,7 @@ export {
   applyArchivedToolResultReadModelStatuses,
   compareRuntimeReadModelMessages,
   classifyRuntimeEventTerminalFact,
+  isHardRuntimeEventReadModelDiagnostic,
 } from './runtime-event-read-model.js';
 export type {
   ArchivedToolResultReadModelStatus,

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import {
@@ -21,6 +21,10 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, before, test } from 'node:test';
 import { openManagedWorkspaceOwner } from '../managed-workspace-owner.js';
+import {
+  inspectManagedWorkspaceExecutionHandleInternal,
+  inspectManagedWorkspaceExecutionScopeInternal,
+} from '../managed-workspace-execution-authority-internal.js';
 import { createGitWorkspaceService } from '../git-workspace-service.js';
 import * as publicStorage from '../index.js';
 import { acquireOperationalStateDatabase } from '../operational-state-store.js';
@@ -57,6 +61,10 @@ test('does not expose baseline receipt issuance on the public Git workspace serv
 
 test('does not expose artifact-only workspace creation through the public storage API', async () => {
   assert.equal('createGitWorkspaceService' in publicStorage, false);
+  assert.equal('issueManagedWorkspaceExecutionHandleInternal' in publicStorage, false);
+  assert.equal('inspectManagedWorkspaceExecutionHandleInternal' in publicStorage, false);
+  assert.equal('issueManagedWorkspaceExecutionScopeInternal' in publicStorage, false);
+  assert.equal('inspectManagedWorkspaceExecutionScopeInternal' in publicStorage, false);
   const root = await temporaryRoot();
   const storageRoot = join(root, 'storage');
   const capability = await resolveStorageRoot({ path: storageRoot, kind: 'interactive' });
@@ -102,23 +110,25 @@ test('opens one canonical baseline from a durable verified Git receipt', async (
 
     const first = await owner.openManagedWorkspaceBaseline(runtimeStore, input);
     const retry = await owner.openManagedWorkspaceBaseline(runtimeStore, input);
+    const firstEvidence = inspectManagedWorkspaceExecutionHandleInternal(first.executionHandle);
+    const retryEvidence = inspectManagedWorkspaceExecutionHandleInternal(retry.executionHandle);
 
     assert.equal(first.created, true);
     assert.equal(retry.created, false);
-    assert.equal('committedAt' in first.receipt, false);
-    assert.deepEqual(retry.receipt, first.receipt);
-    assert.equal(first.head.commitOid, first.binding.baselineCommitOid);
-    assert.equal(first.head.treeOid, first.binding.baselineTreeOid);
-    assert.equal(first.receipt.changedFileCount, 2);
-    assert.equal(first.receipt.deletedFileCount, 0);
-    assert.equal(first.receipt.policyVersion, 1);
+    assert.equal('committedAt' in firstEvidence.receipt, false);
+    assert.deepEqual(retryEvidence.receipt, firstEvidence.receipt);
+    assert.equal(first.head.commitOid, firstEvidence.binding.baselineCommitOid);
+    assert.equal(first.head.treeOid, firstEvidence.binding.baselineTreeOid);
+    assert.equal(firstEvidence.receipt.changedFileCount, 2);
+    assert.equal(firstEvidence.receipt.deletedFileCount, 0);
+    assert.equal(firstEvidence.receipt.policyVersion, 1);
     assert.equal(
-      first.receipt.policyHash,
+      firstEvidence.receipt.policyHash,
       'sha256:48eb80c9c8dd6c4d1e7a635dcc187488e0e0b20e2296b81bbaae0be7c5467341',
     );
-    assert.match(first.receipt.treeDeltaDigest, /^sha256:[a-f0-9]{64}$/u);
+    assert.match(firstEvidence.receipt.treeDeltaDigest, /^sha256:[a-f0-9]{64}$/u);
     assert.equal(
-      first.receipt.treeDeltaDigest,
+      firstEvidence.receipt.treeDeltaDigest,
       'sha256:84a37411a467c40c9fd763ab128a6b23e56ec74ab3da2bd54de8d61e375244e8',
     );
     assert.deepEqual(
@@ -135,11 +145,11 @@ test('opens one canonical baseline from a durable verified Git receipt', async (
       unrelatedStore.close();
     }
 
-    const receiptPath = join(dirname(first.binding.worktreePath), 'baseline-receipt.json');
+    const receiptPath = join(dirname(firstEvidence.binding.worktreePath), 'baseline-receipt.json');
     await writeFile(
       receiptPath,
       `${JSON.stringify({
-        ...first.receipt,
+        ...firstEvidence.receipt,
         treeDeltaDigest: `sha256:${'f'.repeat(64)}`,
       })}\n`,
       'utf8',
@@ -148,12 +158,12 @@ test('opens one canonical baseline from a durable verified Git receipt', async (
       owner.openManagedWorkspaceBaseline(runtimeStore, input),
       /does not match its verified Git boundary/u,
     );
-    await writeFile(receiptPath, `${JSON.stringify(first.receipt)}\n`, 'utf8');
+    await writeFile(receiptPath, `${JSON.stringify(firstEvidence.receipt)}\n`, 'utf8');
 
     await writeFile(
       receiptPath,
       `${JSON.stringify({
-        ...first.receipt,
+        ...firstEvidence.receipt,
         workspaceVersionId: `version_${'a'.repeat(32)}`,
         epochOpenedEventId: `workspace_epoch_opened_${'b'.repeat(64)}`,
         baselineAcceptedEventId: `workspace_baseline_accepted_${'c'.repeat(64)}`,
@@ -165,20 +175,20 @@ test('opens one canonical baseline from a durable verified Git receipt', async (
       owner.openManagedWorkspaceBaseline(runtimeStore, input),
       /does not match its verified Git boundary/u,
     );
-    await writeFile(receiptPath, `${JSON.stringify(first.receipt)}\n`, 'utf8');
+    await writeFile(receiptPath, `${JSON.stringify(firstEvidence.receipt)}\n`, 'utf8');
 
     await writeFile(
       receiptPath,
-      `${JSON.stringify({ ...first.receipt, committedAt: Date.now() })}\n`,
+      `${JSON.stringify({ ...firstEvidence.receipt, committedAt: Date.now() })}\n`,
       'utf8',
     );
     await assert.rejects(
       owner.openManagedWorkspaceBaseline(runtimeStore, input),
       /Invalid managed workspace baseline receipt/u,
     );
-    await writeFile(receiptPath, `${JSON.stringify(first.receipt)}\n`, 'utf8');
+    await writeFile(receiptPath, `${JSON.stringify(firstEvidence.receipt)}\n`, 'utf8');
 
-    const bindingPath = join(dirname(first.binding.worktreePath), 'binding.json');
+    const bindingPath = join(dirname(firstEvidence.binding.worktreePath), 'binding.json');
     await rm(receiptPath);
     await rm(bindingPath);
     await assert.rejects(
@@ -232,8 +242,11 @@ test('reuses an orphan receipt after interruption before SQLite acceptance', asy
     );
 
     const recovered = await owner.openManagedWorkspaceBaseline(runtimeStore, input);
+    const recoveredEvidence = inspectManagedWorkspaceExecutionHandleInternal(
+      recovered.executionHandle,
+    );
     assert.equal(recovered.created, true);
-    assert.equal(recovered.receipt.baselineAcceptedEventId, recovered.head.acceptedEventId);
+    assert.equal(recoveredEvidence.receipt.baselineAcceptedEventId, recovered.head.acceptedEventId);
     await owner.close();
   } finally {
     runtimeStore.close();
@@ -261,7 +274,10 @@ test('rejects a receipt read through a replaced instance-root symlink before par
       runtimeStore,
       openRequest(sourceRoot),
     );
-    const instanceRoot = dirname(accepted.binding.worktreePath);
+    const acceptedEvidence = inspectManagedWorkspaceExecutionHandleInternal(
+      accepted.executionHandle,
+    );
+    const instanceRoot = dirname(acceptedEvidence.binding.worktreePath);
     const externalRoot = join(root, 'external-instance');
     await mkdir(externalRoot, { recursive: true });
     const movedInstance = join(externalRoot, 'instance');
@@ -301,7 +317,10 @@ test('serializes concurrent baseline opens under the same managed workspace owne
       owner.openManagedWorkspaceBaseline(runtimeStore, openRequest(sourceRoot)),
     ]);
     assert.deepEqual([left.created, right.created].sort(), [false, true]);
-    assert.deepEqual(left.receipt, right.receipt);
+    assert.deepEqual(
+      inspectManagedWorkspaceExecutionHandleInternal(left.executionHandle).receipt,
+      inspectManagedWorkspaceExecutionHandleInternal(right.executionHandle).receipt,
+    );
     assert.deepEqual(left.head, right.head);
     await owner.close();
   } finally {
@@ -799,8 +818,11 @@ test('keeps an orphan receipt across SQLite rollback and accepts it on retry', a
     );
 
     const recovered = await owner.openManagedWorkspaceBaseline(runtimeStore, input);
+    const recoveredEvidence = inspectManagedWorkspaceExecutionHandleInternal(
+      recovered.executionHandle,
+    );
     assert.equal(recovered.created, true);
-    assert.equal(recovered.receipt.workspaceVersionId, recovered.head.workspaceVersionId);
+    assert.equal(recoveredEvidence.receipt.workspaceVersionId, recovered.head.workspaceVersionId);
     await owner.close();
   } finally {
     runtimeStore.close();
@@ -853,9 +875,12 @@ test('accepts the same durable receipt after a real process crash before SQLite 
       const accepted = await owner.openManagedWorkspaceBaseline(runtimeStore, {
         ...openRequest(sourceRoot),
       });
+      const acceptedEvidence = inspectManagedWorkspaceExecutionHandleInternal(
+        accepted.executionHandle,
+      );
       assert.equal(accepted.created, true);
-      assert.equal(accepted.receipt.baselineAcceptedEventId, accepted.head.acceptedEventId);
-      assert.deepEqual(accepted.receipt, durableBeforeCrash);
+      assert.equal(acceptedEvidence.receipt.baselineAcceptedEventId, accepted.head.acceptedEventId);
+      assert.deepEqual(acceptedEvidence.receipt, durableBeforeCrash);
       await owner.close();
     } finally {
       runtimeStore.close();
@@ -912,9 +937,76 @@ test('reopens the exact accepted baseline after a real crash before post-commit 
         runtimeStore,
         openRequest(sourceRoot),
       );
+      const reopenedEvidence = inspectManagedWorkspaceExecutionHandleInternal(
+        reopened.executionHandle,
+      );
       assert.equal(reopened.created, false);
-      assert.deepEqual(reopened.receipt, durableBeforeCrash);
-      assert.equal(reopened.head.acceptedEventId, reopened.receipt.baselineAcceptedEventId);
+      assert.deepEqual(reopenedEvidence.receipt, durableBeforeCrash);
+      assert.equal(reopened.head.acceptedEventId, reopenedEvidence.receipt.baselineAcceptedEventId);
+      await owner.close();
+    } finally {
+      runtimeStore.close();
+      await rootOwner.close();
+    }
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+});
+
+test('reissues execution authority after a real process crash during admission verification', {
+  timeout: 60_000,
+}, async () => {
+  const root = await temporaryRoot();
+  const storageRoot = join(root, 'storage');
+  const sourceRoot = await createEligibleSource(join(root, 'source'));
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('./fixtures/git-workspace-service-crash-child.js', import.meta.url))],
+    {
+      env: {
+        ...process.env,
+        MAKA_GIT_WORKSPACE_STORAGE: storageRoot,
+        MAKA_GIT_WORKSPACE_SOURCE: sourceRoot,
+        MAKA_GIT_WORKSPACE_EXECUTABLE: gitExecutablePath,
+        MAKA_GIT_WORKSPACE_SHA256: gitExecutableSha256,
+        MAKA_GIT_WORKSPACE_FAILPOINT: 'after_execution_artifact_verification',
+        MAKA_GIT_WORKSPACE_ACTION: 'execution-admission',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  try {
+    await waitForReady(child, 30_000);
+    child.kill('SIGKILL');
+    await waitForExit(child);
+
+    const capability = await resolveStorageRoot({ path: storageRoot, kind: 'interactive' });
+    const rootOwner = await tryAcquireInteractiveRootOwner(capability);
+    assert.ok(rootOwner);
+    const runtimeStore = createSqliteRuntimeStore(join(storageRoot, 'runtime.sqlite'));
+    try {
+      const owner = await openManagedWorkspaceOwner({
+        rootOwner,
+        gitRuntime: {
+          executablePath: gitExecutablePath,
+          expectedSha256: gitExecutableSha256,
+        },
+      });
+      const reopened = await owner.openManagedWorkspaceBaseline(
+        runtimeStore,
+        openRequest(sourceRoot),
+      );
+      let observedCwd: string | undefined;
+      await owner.withManagedWorkspaceExecution(reopened.executionHandle, async (scope) => {
+        const context = inspectManagedWorkspaceExecutionScopeInternal(scope);
+        observedCwd = context.cwd;
+        assert.equal(await readFile(join(context.cwd, 'tracked.txt'), 'utf8'), 'tracked\n');
+      });
+      assert.equal(
+        observedCwd,
+        inspectManagedWorkspaceExecutionHandleInternal(reopened.executionHandle).binding
+          .worktreePath,
+      );
       await owner.close();
     } finally {
       runtimeStore.close();
@@ -931,20 +1023,7 @@ test('rejects a source tree containing a non-UTF-8 Git path', {
   const root = await temporaryRoot();
   const storageRoot = join(root, 'storage');
   const sourceRoot = await createEligibleSource(join(root, 'source'));
-  const invalidPath = Buffer.concat([Buffer.from(`${sourceRoot}/`, 'utf8'), Buffer.from([0xff])]);
-  await writeFile(invalidPath, 'invalid path bytes\n');
-  await git(sourceRoot, 'add', '-A');
-  await git(
-    sourceRoot,
-    '-c',
-    'user.name=Maka Test',
-    '-c',
-    'user.email=test@maka.invalid',
-    'commit',
-    '--quiet',
-    '-m',
-    'add invalid path',
-  );
+  await commitInvalidUtf8Path(sourceRoot);
   const capability = await resolveStorageRoot({ path: storageRoot, kind: 'interactive' });
   const rootOwner = await tryAcquireInteractiveRootOwner(capability);
   assert.ok(rootOwner);
@@ -1012,6 +1091,52 @@ async function createEligibleSource(sourceRoot: string): Promise<string> {
   return realpath(sourceRoot);
 }
 
+async function commitInvalidUtf8Path(sourceRoot: string): Promise<void> {
+  const invalidPath = Buffer.from([0xff]);
+  const blobOid = gitWithInput(sourceRoot, ['hash-object', '-w', '--stdin'], 'invalid\n')
+    .toString('ascii')
+    .trim();
+  const existingEntries = gitWithInput(sourceRoot, ['ls-tree', '-z', 'HEAD']);
+  const invalidEntry = Buffer.concat([
+    Buffer.from(`100644 blob ${blobOid}\t`, 'ascii'),
+    invalidPath,
+    Buffer.from([0]),
+  ]);
+  const treeOid = gitWithInput(
+    sourceRoot,
+    ['mktree', '-z'],
+    Buffer.concat([existingEntries, invalidEntry]),
+  )
+    .toString('ascii')
+    .trim();
+  const parentOid = await git(sourceRoot, 'rev-parse', 'HEAD');
+  const commitOid = gitWithInput(
+    sourceRoot,
+    [
+      '-c',
+      'user.name=Maka Test',
+      '-c',
+      'user.email=test@maka.invalid',
+      'commit-tree',
+      treeOid,
+      '-p',
+      parentOid,
+    ],
+    'add invalid path\n',
+  )
+    .toString('ascii')
+    .trim();
+
+  await git(sourceRoot, 'update-ref', 'HEAD', commitOid, parentOid);
+  await git(sourceRoot, 'read-tree', treeOid);
+  // Keep Git status clean without asking the filesystem to materialize the invalid path.
+  gitWithInput(
+    sourceRoot,
+    ['update-index', '--skip-worktree', '-z', '--stdin'],
+    Buffer.concat([invalidPath, Buffer.from([0])]),
+  );
+}
+
 function openRequest(sourceRoot: string) {
   return {
     repositoryId: 'repository_11111111111111111111111111111111',
@@ -1047,6 +1172,18 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
     maxBuffer: 8 * 1024 * 1024,
   });
   return stdout.trim();
+}
+
+function gitWithInput(
+  cwd: string,
+  args: readonly string[],
+  input: string | Buffer = Buffer.alloc(0),
+): Buffer {
+  return execFileSync('git', args, {
+    cwd,
+    input,
+    maxBuffer: 8 * 1024 * 1024,
+  });
 }
 
 function waitForReady(child: ReturnType<typeof spawn>, timeoutMs: number): Promise<void> {

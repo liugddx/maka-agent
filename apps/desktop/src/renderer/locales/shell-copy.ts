@@ -356,11 +356,6 @@ type ShellCopy = {
     expandWorkbar: string;
     collapseWorkbar: string;
     workspaceActions: string;
-    feedback: string;
-    openCommandPalette: string;
-    openHelp: string;
-    openHealth: string;
-    moreActions: string;
   };
   app: {
     loadingWorkbarLabel: string;
@@ -373,6 +368,8 @@ type ShellCopy = {
     resumeStartedDescription: string;
     resumeFailedTitle: string;
     resumeFailedFallback: string;
+    goalClearFailedTitle: string;
+    goalClearFailedFallback: string;
     appearanceLoadErrorTitle: string;
     appearanceLoadErrorFallback: string;
     memoryRefreshErrorTitle: string;
@@ -386,7 +383,12 @@ type ShellCopy = {
     updateInstallFailedTitle: string;
     updateInstallFailedFallback: string;
     updateInstallManualFallback: string;
-    updateDownloadFailedTitle: string;
+    updateActiveTasksTitle: string;
+    updateActiveTasksDescription: string;
+    updateActiveTasksConfirm: string;
+    updateActiveTasksCancel: string;
+    updateRetryFailedTitle: string;
+    updateRetryFailedFallback: string;
     updateOpenFailedTitle: string;
     updateOpenManualFallback: string;
     loading: string;
@@ -1022,11 +1024,6 @@ const SHELL_COPY_BY_LOCALE = {
       expandWorkbar: '展开会话工作栏',
       collapseWorkbar: '收起会话工作栏',
       workspaceActions: '工作区辅助操作',
-      feedback: '问题反馈',
-      openCommandPalette: '打开命令面板',
-      openHelp: '打开帮助',
-      openHealth: '打开健康中心',
-      moreActions: '更多操作',
     },
     app: {
       loadingWorkbarLabel: '正在加载会话工作栏',
@@ -1039,6 +1036,8 @@ const SHELL_COPY_BY_LOCALE = {
       resumeStartedDescription: '正在从最后一个完整执行边界继续',
       resumeFailedTitle: '恢复失败',
       resumeFailedFallback: '无法启动安全恢复，请检查会话状态后重试。',
+      goalClearFailedTitle: '停止目标失败',
+      goalClearFailedFallback: '目标仍可能继续运行，请立即重试。',
       appearanceLoadErrorTitle: '载入外观设置失败',
       appearanceLoadErrorFallback: '外观设置暂时无法载入，请稍后重试。',
       memoryRefreshErrorTitle: '刷新本地记忆状态失败',
@@ -1052,7 +1051,12 @@ const SHELL_COPY_BY_LOCALE = {
       updateInstallFailedTitle: '无法安装更新',
       updateInstallFailedFallback: '请稍后重试。',
       updateInstallManualFallback: '请稍后重试，或手动下载最新版本。',
-      updateDownloadFailedTitle: '无法下载更新',
+      updateActiveTasksTitle: '仍有任务正在运行',
+      updateActiveTasksDescription: '仍有任务正在运行。更新会中断这些任务，是否继续？',
+      updateActiveTasksConfirm: '仍然更新',
+      updateActiveTasksCancel: '取消',
+      updateRetryFailedTitle: '无法重新下载更新',
+      updateRetryFailedFallback: '请稍后重试，或手动下载最新版本。',
       updateOpenFailedTitle: '无法打开更新',
       updateOpenManualFallback: '请稍后重试，或前往 GitHub Releases 下载最新版本。',
       loading: '加载中',
@@ -1526,11 +1530,6 @@ const SHELL_COPY_BY_LOCALE = {
       expandWorkbar: 'Expand conversation workbar',
       collapseWorkbar: 'Collapse conversation workbar',
       workspaceActions: 'Workspace actions',
-      feedback: 'Send feedback',
-      openCommandPalette: 'Open command palette',
-      openHelp: 'Open help',
-      openHealth: 'Open Health Center',
-      moreActions: 'More actions',
     },
     app: {
       loadingWorkbarLabel: 'Loading conversation workbar',
@@ -1543,6 +1542,8 @@ const SHELL_COPY_BY_LOCALE = {
       resumeStartedDescription: 'Continuing from the last complete execution boundary',
       resumeFailedTitle: 'Recovery failed',
       resumeFailedFallback: 'Safe recovery could not start. Check the conversation state and try again.',
+      goalClearFailedTitle: 'Could not stop the goal',
+      goalClearFailedFallback: 'The goal may still be running. Try again now.',
       appearanceLoadErrorTitle: 'Could not load appearance settings',
       appearanceLoadErrorFallback: 'Appearance settings are temporarily unavailable. Try again later.',
       memoryRefreshErrorTitle: 'Could not refresh local memory status',
@@ -1556,7 +1557,12 @@ const SHELL_COPY_BY_LOCALE = {
       updateInstallFailedTitle: 'Could not install update',
       updateInstallFailedFallback: 'Try again later.',
       updateInstallManualFallback: 'Try again later, or download the latest version manually.',
-      updateDownloadFailedTitle: 'Could not download update',
+      updateActiveTasksTitle: 'Tasks are still running',
+      updateActiveTasksDescription: 'Tasks are still running. Updating will interrupt them. Continue?',
+      updateActiveTasksConfirm: 'Update anyway',
+      updateActiveTasksCancel: 'Cancel',
+      updateRetryFailedTitle: 'Could not retry update download',
+      updateRetryFailedFallback: 'Try again later, or download the latest version manually.',
       updateOpenFailedTitle: 'Could not open update',
       updateOpenManualFallback: 'Try again later, or download the latest version from GitHub Releases.',
       loading: 'Loading',

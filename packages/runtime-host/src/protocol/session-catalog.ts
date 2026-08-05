@@ -1,13 +1,17 @@
 import { isCollaborationMode, type CollaborationMode } from '@maka/core/collaboration';
 import { isOrchestrationMode, type OrchestrationMode } from '@maka/core/orchestration';
 import { isPermissionMode, type PermissionMode } from '@maka/core/permission';
+import { isSessionStartMode, type SessionStartMode } from '@maka/core/explore-agent';
 import {
   isSessionBlockedReason,
   isSessionStatus,
   type SessionBlockedReason,
   type SessionStatus,
+  type SessionSubagentProjection,
 } from '@maka/core/session';
 import { isThinkingLevel, type ThinkingLevel } from '@maka/core/model-thinking';
+import type { ExecutionBoundarySummary } from '@maka/core/sandbox-boundary';
+export type { ExecutionBoundarySummary } from '@maka/core/sandbox-boundary';
 import {
   assertAllowedKeys,
   requireCount,
@@ -20,6 +24,8 @@ import {
 } from './codec.js';
 import { invalidProtocolFrame } from './errors.js';
 import { defineOperation } from './operation-spec.js';
+
+export type { SessionSubagentProjection } from '@maka/core/session';
 
 export const SESSION_CATALOG_PAGE_MAX_ITEMS = 32;
 export const SESSION_CATALOG_RESULT_MAX_BYTES = 48 * 1024;
@@ -49,6 +55,7 @@ const CONFIGURATION_UPDATE_ERRORS = [
   'operation_conflict',
 ] as const;
 const READ_MARKER_ERRORS = [...METADATA_UPDATE_ERRORS, 'operation_conflict'] as const;
+const EXECUTION_BOUNDARY_QUERY_ERRORS = [...QUERY_ERRORS, 'not_found'] as const;
 
 const PROJECTION_REQUIRED_FIELDS = [
   'id',
@@ -119,6 +126,7 @@ export type SessionModelTarget =
 export interface SessionCreateInput {
   readonly sessionId: string;
   readonly cwd: string;
+  readonly mode?: SessionStartMode;
   readonly projectId?: string | null;
   readonly name?: string;
   readonly labels?: readonly string[];
@@ -166,11 +174,8 @@ export interface SessionReadMarkerSetInput {
   readonly readThroughMessageId: string;
 }
 
-export interface SessionSubagentProjection {
-  readonly parentSessionId: string;
-  readonly agentId?: string;
-  readonly agentName?: string;
-  readonly profile?: string;
+export interface SessionExecutionBoundaryQueryInput {
+  readonly sessionId: string;
 }
 
 export interface SessionCatalogProjection {
@@ -316,7 +321,52 @@ export const SESSION_CATALOG_OPERATION_SPECS = {
     decodeOutput: decodeSessionCatalogItem,
     assertOutputForInput: (input, output) => assertSessionIdentity(input.sessionId, output),
   }),
+  'session.execution_boundary.query': defineOperation<
+    SessionExecutionBoundaryQueryInput,
+    ExecutionBoundarySummary,
+    (typeof EXECUTION_BOUNDARY_QUERY_ERRORS)[number]
+  >({
+    mode: 'query',
+    availability: 'ready',
+    errors: EXECUTION_BOUNDARY_QUERY_ERRORS,
+    decodeInput: decodeSessionExecutionBoundaryQueryInput,
+    decodeOutput: decodeExecutionBoundarySummary,
+  }),
 } as const;
+
+export function decodeSessionExecutionBoundaryQueryInput(
+  value: unknown,
+): SessionExecutionBoundaryQueryInput {
+  const input = requireExactRecord(value, 'Session execution boundary query input', ['sessionId']);
+  return { sessionId: requireEntityId(input.sessionId, 'sessionId') };
+}
+
+export function decodeExecutionBoundarySummary(value: unknown): ExecutionBoundarySummary {
+  const boundary = requireRecord(value, 'Session execution boundary summary');
+  if (boundary.kind === 'managed') {
+    const exact = requireExactRecord(boundary, 'Managed execution boundary summary', [
+      'kind',
+      'access',
+      'revision',
+    ]);
+    if (exact.access !== 'read_only' && exact.access !== 'writable') {
+      throw invalidProtocolFrame('Invalid managed execution boundary access');
+    }
+    return {
+      kind: 'managed',
+      access: exact.access,
+      revision: requireCount(exact.revision, 'Execution boundary revision'),
+    };
+  }
+  if (boundary.kind === 'bypass' || boundary.kind === 'external') {
+    const exact = requireExactRecord(boundary, 'Execution boundary summary', ['kind', 'revision']);
+    return {
+      kind: boundary.kind,
+      revision: requireCount(exact.revision, 'Execution boundary revision'),
+    };
+  }
+  throw invalidProtocolFrame('Invalid execution boundary summary');
+}
 
 export function decodeSessionCatalogQueryInput(value: unknown): SessionCatalogQueryInput {
   const input = requireRecord(value, 'Session catalog query input');
@@ -363,6 +413,7 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
     'Session create input',
     ['sessionId', 'cwd', 'modelTarget'],
     [
+      'mode',
       'projectId',
       'name',
       'labels',
@@ -375,6 +426,7 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
   return {
     sessionId: requireEntityId(input.sessionId, 'sessionId'),
     cwd: requireUtf8String(input.cwd, 'Session cwd', SESSION_CATALOG_CWD_MAX_BYTES),
+    ...(Object.hasOwn(input, 'mode') ? { mode: sessionStartMode(input.mode) } : {}),
     ...(Object.hasOwn(input, 'projectId')
       ? {
           projectId:
@@ -403,6 +455,11 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
       ? { orchestrationMode: orchestrationMode(input.orchestrationMode) }
       : {}),
   };
+}
+
+function sessionStartMode(value: unknown): SessionStartMode {
+  if (!isSessionStartMode(value)) throw invalidProtocolFrame('Invalid Session start mode');
+  return value;
 }
 
 export function decodeSessionMetadataUpdateInput(value: unknown): SessionMetadataUpdateInput {

@@ -1,0 +1,1004 @@
+import { createHash, randomUUID } from 'node:crypto';
+import type { AttachmentRef, ShellRunUpdate } from '@maka/core/events';
+import type { PlanSessionState, PlanUserControlInput } from '@maka/core/plan';
+import { decodeStoredMessageForRead, type StoredMessage } from '@maka/core/session';
+import type { Task } from '@maka/core/task-ledger';
+import {
+  canonicalPricingConfigsEqual,
+  comparePricingModelKeys,
+} from '@maka/core/usage-stats/pricing';
+import type { PricingConfig } from '@maka/core/usage-stats/types';
+import {
+  type ClientCapabilityProvider,
+  type DirectRequestOperationKey,
+  type RuntimeHostConnection,
+  type RuntimeHostSessionSubscription,
+  RuntimeHostOperationError,
+} from '@maka/runtime-host/client';
+import {
+  ARTIFACT_INGEST_CHUNK_MAX_BYTES,
+  decodePricingMutateInput,
+  type EffectivePricingEntry,
+  type ClientCapabilityReplaceResult,
+  type ClientCapabilityUnregisterResult,
+  type InteractionAnswerInput,
+  type GoalControlAction,
+  type GoalProjection,
+  type OperationInput,
+  type OperationOutput,
+  type PlanProjectionItem,
+  type PlanQueryResult,
+  type PricingMutation,
+  type PricingQueryResult,
+  type QueueRetractInput,
+  type QueueRetractResult,
+  type SessionCatalogFilter,
+  type SessionCatalogItem,
+  type SessionCatalogProjection,
+  type SessionCatalogQueryResult,
+  type SessionConfiguration,
+  type SessionContinuitySnapshot,
+  type SessionConversationCopyInput,
+  type SessionConversationCopyResult,
+  type SessionCreateInput,
+  type ExecutionBoundarySummary,
+  type SessionLifecycleState,
+  type SessionMetadataPatch,
+  type SessionUpdateResult,
+  type SubscriptionFrame,
+  type TurnInterruptInput,
+  type TurnInterruptResult,
+  type TurnMessageSubmitInput,
+  type TurnMessageSubmitResult,
+} from '@maka/runtime-host/protocol';
+
+const MAX_OPTIMISTIC_ATTEMPTS = 3;
+const MAX_PRICING_SNAPSHOT_ATTEMPTS = 3;
+
+export type DesktopSessionConfigurationPatch = Partial<SessionConfiguration>;
+
+export type DesktopRuntimeHostClientErrorCode =
+  | 'catalog_unstable'
+  | 'client_closed'
+  | 'projection_unstable'
+  | 'pricing_snapshot_stale'
+  | 'pricing_unstable'
+  | 'revision_conflict'
+  | 'session_not_found'
+  | 'unsupported_session';
+
+export class DesktopRuntimeHostClientError extends Error {
+  constructor(
+    readonly code: DesktopRuntimeHostClientErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'DesktopRuntimeHostClientError';
+  }
+}
+
+export interface DesktopRuntimeHostSession {
+  readonly snapshot: SessionContinuitySnapshot;
+  readonly transcript: Promise<StoredMessage[]>;
+  readonly events: AsyncIterable<SubscriptionFrame>;
+  close(): Promise<void>;
+}
+
+export interface DesktopPricingSnapshot {
+  readonly hostEpoch: string;
+  readonly connectionId: string;
+  readonly revision: number;
+  readonly entries: readonly EffectivePricingEntry[];
+}
+
+export interface DesktopPricingMutationInput {
+  readonly base: DesktopPricingSnapshot;
+  readonly mutation: PricingMutation;
+}
+
+export type DesktopPricingMutationOutcome =
+  | {
+      readonly kind: 'saved';
+      readonly disposition: 'committed' | 'unchanged';
+      readonly snapshot: DesktopPricingSnapshot;
+    }
+  | {
+      readonly kind: 'saved_refresh_failed';
+      readonly disposition: 'committed' | 'unchanged';
+    }
+  | {
+      readonly kind: 'synchronized' | 'review_required';
+      readonly reason: 'revision_conflict' | 'outcome_unknown';
+      readonly snapshot: DesktopPricingSnapshot;
+    }
+  | {
+      readonly kind: 'reconciliation_unavailable';
+      readonly reason: 'revision_conflict' | 'outcome_unknown';
+    };
+
+type PricingReconciliationTarget =
+  | { readonly kind: 'upsert'; readonly pricing: Readonly<PricingConfig> }
+  | {
+      readonly kind: 'delete';
+      readonly modelKey: string;
+      readonly expected: 'builtin' | 'unpriced' | 'no_override';
+    };
+
+export class DesktopRuntimeHostClient {
+  readonly #sessions = new Set<DesktopSessionHandle>();
+  #closeTask: Promise<void> | undefined;
+
+  constructor(private readonly connection: RuntimeHostConnection) {}
+
+  async loadPricingSnapshot(): Promise<DesktopPricingSnapshot> {
+    for (let attempt = 0; attempt < MAX_PRICING_SNAPSHOT_ATTEMPTS; attempt += 1) {
+      const snapshot = await this.#readPricingSnapshot();
+      if (snapshot) return snapshot;
+    }
+    throw new DesktopRuntimeHostClientError(
+      'pricing_unstable',
+      'Pricing kept changing while Desktop read it',
+    );
+  }
+
+  async applyPricingMutation(
+    input: DesktopPricingMutationInput,
+  ): Promise<DesktopPricingMutationOutcome> {
+    this.#assertOpen();
+    if (
+      input.base.hostEpoch !== this.connection.hostEpoch ||
+      input.base.connectionId !== this.connection.connectionId
+    ) {
+      throw new DesktopRuntimeHostClientError(
+        'pricing_snapshot_stale',
+        'Pricing snapshot belongs to a different Runtime Host connection',
+      );
+    }
+    const request = decodePricingMutateInput({
+      expectedRevision: input.base.revision,
+      mutation: input.mutation,
+    });
+    const reconciliationTarget = createPricingReconciliationTarget(
+      input.base,
+      request.mutation,
+    );
+    let result: OperationOutput<'pricing.mutate'>;
+    try {
+      result = await this.#request('pricing.mutate', request);
+    } catch (error) {
+      if (
+        error instanceof RuntimeHostOperationError &&
+        error.code !== 'commit_outcome_unknown'
+      ) {
+        throw error;
+      }
+      return this.#reconcilePricingMutation(reconciliationTarget, 'outcome_unknown');
+    }
+
+    if (result.kind === 'revision_conflict') {
+      return this.#reconcilePricingMutation(reconciliationTarget, 'revision_conflict');
+    }
+
+    try {
+      return {
+        kind: 'saved',
+        disposition: result.kind,
+        snapshot: await this.loadPricingSnapshot(),
+      };
+    } catch {
+      return { kind: 'saved_refresh_failed', disposition: result.kind };
+    }
+  }
+
+  async listSessions(filter?: SessionCatalogFilter): Promise<SessionCatalogProjection[]> {
+    for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt += 1) {
+      const sessions = await this.#readCatalog(filter);
+      if (sessions) return sessions;
+    }
+    throw new DesktopRuntimeHostClientError(
+      'catalog_unstable',
+      'Session catalog kept changing while Desktop read it',
+    );
+  }
+
+  async getSession(sessionId: string): Promise<SessionCatalogProjection | null> {
+    const result = await this.#request('session.catalog.query', { kind: 'get', sessionId });
+    if (result.kind !== 'session') {
+      throw new DesktopRuntimeHostClientError(
+        'catalog_unstable',
+        'Runtime Host returned an invalid Session catalog lookup',
+      );
+    }
+    return result.session === null ? null : requireSessionProjection(result.session);
+  }
+
+  async createSession(input: SessionCreateInput): Promise<SessionCatalogProjection> {
+    return requireSessionProjection(await this.#request('session.create', input));
+  }
+
+  updateSessionMetadata(
+    sessionId: string,
+    patch: SessionMetadataPatch,
+  ): Promise<SessionCatalogProjection> {
+    return this.#updateSession(sessionId, (current) =>
+      this.#request('session.metadata.update', {
+        sessionId,
+        expectedRevision: current.revision,
+        patch,
+      }),
+    );
+  }
+
+  async updateSessionConfiguration(
+    sessionId: string,
+    patch: DesktopSessionConfigurationPatch,
+  ): Promise<SessionCatalogProjection> {
+    const definedPatch = Object.fromEntries(
+      Object.entries(patch).filter(([, value]) => value !== undefined),
+    ) as DesktopSessionConfigurationPatch;
+    if (Object.keys(definedPatch).length === 0) return this.#requireSession(sessionId);
+    return this.#updateSession(sessionId, (current) =>
+      this.#request('session.configuration.update', {
+        sessionId,
+        expectedRevision: current.revision,
+        configuration: {
+          // An unlocked Session still follows the Host-owned default route.
+          // Once execution or an explicit model change locks it, the resolved
+          // catalog route is the explicit target that must survive this patch.
+          modelTarget: current.connectionLocked
+            ? {
+                kind: 'explicit',
+                connectionSlug: current.llmConnectionSlug,
+                model: current.model,
+              }
+            : { kind: 'default' },
+          thinkingLevel: current.thinkingLevel ?? null,
+          permissionMode: current.permissionMode,
+          collaborationMode: current.collaborationMode,
+          orchestrationMode: current.orchestrationMode,
+          ...definedPatch,
+        },
+      }),
+    );
+  }
+
+  relocateSessionCwd(sessionId: string, cwd: string): Promise<SessionCatalogProjection> {
+    return this.#updateSession(sessionId, (current) =>
+      this.#request('session.cwd.relocate', {
+        sessionId,
+        expectedRevision: current.revision,
+        cwd,
+      }),
+    );
+  }
+
+  async setSessionReadMarker(
+    sessionId: string,
+    readThroughMessageId: string,
+  ): Promise<SessionCatalogProjection> {
+    return requireSessionProjection(
+      await this.#request('session.read_marker.set', { sessionId, readThroughMessageId }),
+    );
+  }
+
+  readExecutionBoundary(sessionId: string): Promise<ExecutionBoundarySummary> {
+    return this.#request('session.execution_boundary.query', { sessionId });
+  }
+
+  async setSessionLifecycle(
+    sessionId: string,
+    state: SessionLifecycleState,
+  ): Promise<SessionCatalogProjection> {
+    return requireSessionProjection(
+      await this.#request('session.lifecycle.set', { sessionId, state }),
+    );
+  }
+
+  async removeSession(sessionId: string): Promise<void> {
+    for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt += 1) {
+      const current = await this.#requireSession(sessionId);
+      const result = await this.#request('session.remove', {
+        sessionId,
+        expectedRevision: current.revision,
+      });
+      if (result.kind === 'removed') return;
+    }
+    throw revisionConflict('remove', sessionId);
+  }
+
+  async copySession(
+    kind: 'branch' | 'revision',
+    input: Omit<SessionConversationCopyInput, 'expectedSourceRevision'>,
+  ): Promise<SessionCatalogProjection> {
+    for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt += 1) {
+      const source = await this.#requireSession(input.sourceSessionId);
+      const request = { ...input, expectedSourceRevision: source.revision };
+      const result: SessionConversationCopyResult =
+        kind === 'branch'
+          ? await this.#request('session.branch.create', request)
+          : await this.#request('session.revision.create', request);
+      if (result.kind === 'committed') return requireSessionProjection(result.session);
+    }
+    throw revisionConflict(`${kind} copy`, input.sourceSessionId);
+  }
+
+  async ingestAttachment(input: {
+    sessionId: string;
+    name: string;
+    mimeType: string;
+    content: Uint8Array;
+    uploadId?: string;
+  }): Promise<AttachmentRef> {
+    const uploadId = input.uploadId ?? randomUUID();
+    const digest = `sha256:${createHash('sha256').update(input.content).digest('hex')}` as const;
+    let opened = false;
+    try {
+      const begin = await this.#request('artifact.ingest', {
+        kind: 'begin',
+        sessionId: input.sessionId,
+        uploadId,
+        name: input.name,
+        mimeType: input.mimeType,
+        totalBytes: input.content.byteLength,
+        contentSha256: digest,
+      });
+      if (begin.kind === 'committed') return begin.attachment;
+      if (begin.kind !== 'upload_opened') {
+        throw new Error('Runtime Host did not open the Attachment upload');
+      }
+      opened = true;
+      let offset = begin.nextOffset;
+      while (offset < input.content.byteLength) {
+        const chunk = input.content.subarray(
+          offset,
+          Math.min(input.content.byteLength, offset + ARTIFACT_INGEST_CHUNK_MAX_BYTES),
+        );
+        const accepted = await this.#request('artifact.ingest', {
+          kind: 'chunk',
+          sessionId: input.sessionId,
+          uploadId,
+          offset,
+          chunkBase64: Buffer.from(chunk).toString('base64'),
+        });
+        if (accepted.kind !== 'chunk_accepted' || accepted.nextOffset <= offset) {
+          throw new Error('Runtime Host did not advance the Attachment upload');
+        }
+        offset = accepted.nextOffset;
+      }
+      const committed = await this.#request('artifact.ingest', {
+        kind: 'commit',
+        sessionId: input.sessionId,
+        uploadId,
+      });
+      if (committed.kind !== 'committed') {
+        throw new Error('Runtime Host did not commit the Attachment upload');
+      }
+      return committed.attachment;
+    } catch (error) {
+      if (opened) {
+        await this.#request('artifact.ingest', {
+          kind: 'abort',
+          sessionId: input.sessionId,
+          uploadId,
+        }).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  submitMessage(
+    input: Omit<TurnMessageSubmitInput, 'originHostEpoch'>,
+  ): Promise<TurnMessageSubmitResult> {
+    return this.#request('turn.message.submit', {
+      ...input,
+      originHostEpoch: this.connection.hostEpoch,
+    });
+  }
+
+  retractQueue(input: Omit<QueueRetractInput, 'originHostEpoch'>): Promise<QueueRetractResult> {
+    return this.#request('queue.retract', {
+      ...input,
+      originHostEpoch: this.connection.hostEpoch,
+    });
+  }
+
+  interruptTurn(
+    input: Omit<TurnInterruptInput, 'originHostEpoch'>,
+  ): Promise<TurnInterruptResult> {
+    return this.#request('turn.interrupt', {
+      ...input,
+      originHostEpoch: this.connection.hostEpoch,
+    });
+  }
+
+  answerInteraction(input: InteractionAnswerInput): Promise<OperationOutput<'interaction.answer'>> {
+    return this.#request('interaction.answer', input);
+  }
+
+  queryInteraction(
+    input: OperationInput<'interaction.query'>,
+  ): Promise<OperationOutput<'interaction.query'>> {
+    return this.#request('interaction.query', input);
+  }
+
+  startTurn(input: OperationInput<'turn.start'>): Promise<OperationOutput<'turn.start'>> {
+    return this.#request('turn.start', input);
+  }
+
+  queryTurn(input: OperationInput<'turn.query'>): Promise<OperationOutput<'turn.query'>> {
+    return this.#request('turn.query', input);
+  }
+
+  stopTurn(input: OperationInput<'turn.stop'>): Promise<OperationOutput<'turn.stop'>> {
+    return this.#request('turn.stop', input);
+  }
+
+  regenerateTurn(
+    input: OperationInput<'turn.regenerate'>,
+  ): Promise<OperationOutput<'turn.regenerate'>> {
+    return this.#request('turn.regenerate', input);
+  }
+
+  queryTurnResume(
+    input: OperationInput<'turn.resume.query'>,
+  ): Promise<OperationOutput<'turn.resume.query'>> {
+    return this.#request('turn.resume.query', input);
+  }
+
+  startTurnResume(
+    input: OperationInput<'turn.resume.start'>,
+  ): Promise<OperationOutput<'turn.resume.start'>> {
+    return this.#request('turn.resume.start', input);
+  }
+
+  queryContextDiagnostics(
+    sessionId: string,
+  ): Promise<OperationOutput<'context.diagnostics.query'>> {
+    return this.#request('context.diagnostics.query', { sessionId });
+  }
+
+  compactContext(
+    input: OperationInput<'context.compact'>,
+  ): Promise<OperationOutput<'context.compact'>> {
+    return this.#request('context.compact', input);
+  }
+
+  async listTasks(sessionId: string): Promise<Task[]> {
+    const projection = await collectStableProjection({
+      name: 'Task ledger',
+      sessionId,
+      start: () => this.#request('task.ledger.query', { kind: 'list_start', sessionId }),
+      continue: (first, cursor) =>
+        this.#request('task.ledger.query', {
+          kind: 'list_continue',
+          sessionId,
+          revision: first.revision,
+          cursor,
+        }),
+      page(result, first) {
+        if (
+          result.kind !== 'page' ||
+          result.sessionId !== sessionId ||
+          (first !== undefined && result.revision !== first.revision)
+        ) {
+          throw invalidProjection('Task ledger');
+        }
+        return { source: result, items: result.tasks, nextCursor: result.nextCursor };
+      },
+    });
+    return projection.items;
+  }
+
+  queryGoal(sessionId: string): Promise<OperationOutput<'goal.query'>> {
+    return this.#request('goal.query', { sessionId });
+  }
+
+  controlGoal(
+    goal: Pick<GoalProjection, 'sessionId' | 'goalId' | 'revision'>,
+    action: GoalControlAction,
+  ): Promise<OperationOutput<'goal.control'>> {
+    return this.#request('goal.control', {
+      sessionId: goal.sessionId,
+      goalId: goal.goalId,
+      expectedRevision: goal.revision,
+      action,
+    });
+  }
+
+  async clearGoal(sessionId: string): Promise<void> {
+    const initial = await this.queryGoal(sessionId);
+    if (initial.goal === null) return;
+    const goalId = initial.goal.goalId;
+    let goal = initial.goal;
+    for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt += 1) {
+      try {
+        await this.controlGoal(goal, 'clear');
+        return;
+      } catch (error) {
+        if (!(error instanceof RuntimeHostOperationError) || error.code !== 'operation_conflict') {
+          throw error;
+        }
+      }
+      const current = await this.queryGoal(sessionId);
+      if (current.goal === null || current.goal.goalId !== goalId) return;
+      goal = current.goal;
+    }
+    throw revisionConflict('Goal clear', sessionId);
+  }
+
+  async getPlanState(sessionId: string): Promise<PlanSessionState> {
+    const projection = await collectStableProjection({
+      name: 'Plan',
+      sessionId,
+      start: () => this.#request('plan.query', { kind: 'list_start', sessionId }),
+      continue: (first, cursor) =>
+        this.#request('plan.query', {
+          kind: 'list_continue',
+          sessionId,
+          storeVersion: first.storeVersion,
+          cursor,
+        }),
+      page(result, first) {
+        if (
+          result.kind !== 'page' ||
+          result.sessionId !== sessionId ||
+          (first !== undefined && result.storeVersion !== first.storeVersion)
+        ) {
+          throw invalidProjection('Plan');
+        }
+        return { source: result, items: result.items, nextCursor: result.nextCursor };
+      },
+    });
+    return planState(projection.first, projection.items);
+  }
+
+  controlPlan(input: PlanUserControlInput): Promise<OperationOutput<'plan.control'>> {
+    return this.#request('plan.control', input);
+  }
+
+  startPlanTurn(
+    input: OperationInput<'plan.turn.start'>,
+  ): Promise<OperationOutput<'plan.turn.start'>> {
+    return this.#request('plan.turn.start', input);
+  }
+
+  queryAgentGraph(
+    input: OperationInput<'agent.graph.query'>,
+  ): Promise<OperationOutput<'agent.graph.query'>> {
+    return this.#request('agent.graph.query', input);
+  }
+
+  queryAgentGraphOperator(
+    input: OperationInput<'agent.graph.operator.query'>,
+  ): Promise<OperationOutput<'agent.graph.operator.query'>> {
+    return this.#request('agent.graph.operator.query', input);
+  }
+
+  stopAgentGraph(
+    input: OperationInput<'agent.graph.stop'>,
+  ): Promise<OperationOutput<'agent.graph.stop'>> {
+    return this.#request('agent.graph.stop', input);
+  }
+
+  queryDeepResearch(
+    sessionId: string,
+  ): Promise<OperationOutput<'deep-research.query'>> {
+    return this.#request('deep-research.query', { sessionId });
+  }
+
+  async listRuntimeResources(sessionId: string): Promise<ShellRunUpdate[]> {
+    const projection = await collectStableProjection({
+      name: 'Runtime Resource',
+      sessionId,
+      start: () => this.#request('runtime.resource.query', { kind: 'list_start', sessionId }),
+      continue: (first, cursor) =>
+        this.#request('runtime.resource.query', {
+          kind: 'list_continue',
+          sessionId,
+          revision: first.revision,
+          cursor,
+        }),
+      page(result, first) {
+        if (
+          result.kind !== 'page' ||
+          result.sessionId !== sessionId ||
+          (first !== undefined && result.revision !== first.revision)
+        ) {
+          throw invalidProjection('Runtime Resource');
+        }
+        return { source: result, items: result.resources, nextCursor: result.nextCursor };
+      },
+    });
+    return projection.items;
+  }
+
+  async getRuntimeResource(sessionId: string, ref: string): Promise<ShellRunUpdate | null> {
+    const result = await this.#request('runtime.resource.query', { kind: 'get', sessionId, ref });
+    if (result.kind !== 'resource' || result.sessionId !== sessionId) {
+      throw invalidProjection('Runtime Resource');
+    }
+    return result.resource;
+  }
+
+  acquireRuntimeResourceController(
+    input: OperationInput<'runtime.resource.controller.acquire'>,
+  ): Promise<OperationOutput<'runtime.resource.controller.acquire'>> {
+    return this.#request('runtime.resource.controller.acquire', input);
+  }
+
+  controlRuntimeResource(
+    input: OperationInput<'runtime.resource.controller.control'>,
+  ): Promise<OperationOutput<'runtime.resource.controller.control'>> {
+    return this.#request('runtime.resource.controller.control', input);
+  }
+
+  releaseRuntimeResourceController(
+    input: OperationInput<'runtime.resource.controller.release'>,
+  ): Promise<OperationOutput<'runtime.resource.controller.release'>> {
+    return this.#request('runtime.resource.controller.release', input);
+  }
+
+  stopRuntimeResource(
+    input: OperationInput<'runtime.resource.stop'>,
+  ): Promise<OperationOutput<'runtime.resource.stop'>> {
+    return this.#request('runtime.resource.stop', input);
+  }
+
+  replaceClientCapabilities(
+    provider: ClientCapabilityProvider,
+    timeoutMs?: number,
+  ): Promise<ClientCapabilityReplaceResult> {
+    this.#assertOpen();
+    return this.connection.replaceClientCapabilities(provider, timeoutMs);
+  }
+
+  unregisterClientCapabilities(timeoutMs?: number): Promise<ClientCapabilityUnregisterResult> {
+    this.#assertOpen();
+    return this.connection.unregisterClientCapabilities(timeoutMs);
+  }
+
+  async openSession(sessionId: string): Promise<DesktopRuntimeHostSession> {
+    this.#assertOpen();
+    const subscription = await this.connection.openSessionSubscription({ sessionId });
+    if (this.#closeTask) {
+      await subscription.close().catch(() => undefined);
+      throw clientClosed();
+    }
+    const session = new DesktopSessionHandle(subscription, () => this.#sessions.delete(session));
+    this.#sessions.add(session);
+    return session;
+  }
+
+  close(): Promise<void> {
+    this.#closeTask ??= this.#close();
+    return this.#closeTask;
+  }
+
+  async #close(): Promise<void> {
+    try {
+      await Promise.all([...this.#sessions].map((session) => session.close()));
+    } finally {
+      await this.connection.close();
+    }
+  }
+
+  async #readPricingSnapshot(): Promise<DesktopPricingSnapshot | undefined> {
+    this.#assertOpen();
+    const first = await this.#request('pricing.query', { kind: 'start' });
+    if (first.kind !== 'page' || first.offset !== 0) {
+      throw new DesktopRuntimeHostClientError(
+        'pricing_unstable',
+        'Runtime Host returned an invalid initial Pricing page',
+      );
+    }
+    const entries = [...first.entries];
+    const offsets = new Set<number>([0]);
+    let page: Extract<PricingQueryResult, { kind: 'page' }> = first;
+    while (page.nextOffset !== null) {
+      const offset = page.nextOffset;
+      if (offset <= page.offset || offsets.has(offset)) {
+        throw new DesktopRuntimeHostClientError(
+          'pricing_unstable',
+          'Runtime Host repeated a Pricing page offset',
+        );
+      }
+      offsets.add(offset);
+      const next = await this.#request('pricing.query', {
+        kind: 'continue',
+        revision: first.revision,
+        offset,
+      });
+      if (next.kind === 'revision_changed') return undefined;
+      if (next.revision !== first.revision || next.offset !== offset) {
+        throw new DesktopRuntimeHostClientError(
+          'pricing_unstable',
+          'Runtime Host returned an inconsistent Pricing page',
+        );
+      }
+      entries.push(...next.entries);
+      page = next;
+    }
+    if (!pricingEntriesAreCanonical(entries)) {
+      throw new DesktopRuntimeHostClientError(
+        'pricing_unstable',
+        'Runtime Host returned non-canonical Pricing pages',
+      );
+    }
+    return {
+      hostEpoch: this.connection.hostEpoch,
+      connectionId: this.connection.connectionId,
+      revision: first.revision,
+      entries,
+    };
+  }
+
+  async #reconcilePricingMutation(
+    target: PricingReconciliationTarget,
+    reason: 'revision_conflict' | 'outcome_unknown',
+  ): Promise<DesktopPricingMutationOutcome> {
+    try {
+      const snapshot = await this.loadPricingSnapshot();
+      return {
+        kind: pricingTargetMatchesSnapshot(target, snapshot)
+          ? 'synchronized'
+          : 'review_required',
+        reason,
+        snapshot,
+      };
+    } catch {
+      return { kind: 'reconciliation_unavailable', reason };
+    }
+  }
+
+  async #updateSession(
+    sessionId: string,
+    update: (current: SessionCatalogProjection) => Promise<SessionUpdateResult>,
+  ): Promise<SessionCatalogProjection> {
+    for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt += 1) {
+      const current = await this.#requireSession(sessionId);
+      const result = await update(current);
+      if (result.kind === 'committed') return requireSessionProjection(result.session);
+    }
+    throw revisionConflict('update', sessionId);
+  }
+
+  async #readCatalog(
+    filter: SessionCatalogFilter | undefined,
+  ): Promise<SessionCatalogProjection[] | undefined> {
+    const first = await this.#request('session.catalog.query', {
+      kind: 'list_start',
+      ...(filter ? { filter } : {}),
+    });
+    if (first.kind !== 'page') {
+      throw new DesktopRuntimeHostClientError(
+        'catalog_unstable',
+        'Runtime Host returned an invalid initial Session catalog page',
+      );
+    }
+    const sessions: SessionCatalogProjection[] = [];
+    const cursors = new Set<string>();
+    let page: Extract<SessionCatalogQueryResult, { kind: 'page' }> = first;
+    while (true) {
+      sessions.push(...page.sessions.map(requireSessionProjection));
+      const cursor = page.nextCursor;
+      if (cursor === null) return sessions;
+      if (cursors.has(cursor)) {
+        throw new DesktopRuntimeHostClientError(
+          'catalog_unstable',
+          'Runtime Host repeated a Session catalog cursor',
+        );
+      }
+      cursors.add(cursor);
+      const next = await this.#request('session.catalog.query', {
+        kind: 'list_continue',
+        ...(filter ? { filter } : {}),
+        revision: first.revision,
+        cursor,
+      });
+      if (next.kind === 'revision_changed') return undefined;
+      if (next.kind !== 'page') {
+        throw new DesktopRuntimeHostClientError(
+          'catalog_unstable',
+          'Runtime Host returned an invalid Session catalog continuation',
+        );
+      }
+      if (next.revision !== first.revision) return undefined;
+      page = next;
+    }
+  }
+
+  async #requireSession(sessionId: string): Promise<SessionCatalogProjection> {
+    const session = await this.getSession(sessionId);
+    if (session) return session;
+    throw new DesktopRuntimeHostClientError(
+      'session_not_found',
+      `Runtime Host Session not found: ${sessionId}`,
+    );
+  }
+
+  #request<K extends DirectRequestOperationKey>(
+    operation: K,
+    input: OperationInput<K>,
+  ): Promise<OperationOutput<K>> {
+    this.#assertOpen();
+    return this.connection.request(operation, input);
+  }
+
+  #assertOpen(): void {
+    if (this.#closeTask) throw clientClosed();
+  }
+}
+
+class DesktopSessionHandle implements DesktopRuntimeHostSession {
+  readonly snapshot: SessionContinuitySnapshot;
+  readonly transcript: Promise<StoredMessage[]>;
+  readonly events: AsyncIterable<SubscriptionFrame>;
+  #closeTask: Promise<void> | undefined;
+
+  constructor(
+    private readonly subscription: RuntimeHostSessionSubscription,
+    private readonly onClose: () => void,
+  ) {
+    this.snapshot = subscription.snapshot;
+    this.events = subscription;
+    this.transcript = subscription.loadTranscript(decodeStoredMessageForRead);
+    void this.transcript.catch(() => undefined);
+  }
+
+  close(): Promise<void> {
+    this.#closeTask ??= this.subscription.close().finally(this.onClose);
+    return this.#closeTask;
+  }
+}
+
+function requireSessionProjection(item: SessionCatalogItem): SessionCatalogProjection {
+  if (!('kind' in item)) return item;
+  throw new DesktopRuntimeHostClientError(
+    'unsupported_session',
+    `Runtime Host Session is not representable by this Desktop Client: ${item.id}`,
+  );
+}
+
+function clientClosed(): DesktopRuntimeHostClientError {
+  return new DesktopRuntimeHostClientError('client_closed', 'Desktop Runtime Host Client is closed');
+}
+
+function revisionConflict(operation: string, sessionId: string): DesktopRuntimeHostClientError {
+  return new DesktopRuntimeHostClientError(
+    'revision_conflict',
+    `Runtime Host Session kept changing during ${operation}: ${sessionId}`,
+  );
+}
+
+function planState(
+  first: Extract<PlanQueryResult, { kind: 'page' }>,
+  items: readonly PlanProjectionItem[],
+): PlanSessionState {
+  return {
+    schemaVersion: 1,
+    sessionId: first.sessionId,
+    storeVersion: first.storeVersion,
+    proposals: items.flatMap((item) => (item.kind === 'proposal' ? [item.proposal] : [])),
+    executions: items.flatMap((item) => (item.kind === 'execution' ? [item.execution] : [])),
+    ...(first.latestProposalId === null ? {} : { latestProposalId: first.latestProposalId }),
+    ...(first.activeExecutionId === null ? {} : { activeExecutionId: first.activeExecutionId }),
+  };
+}
+
+interface StableProjectionPage<TResult extends { kind: string }, TItem> {
+  source: Exclude<TResult, { kind: 'revision_changed' }>;
+  items: readonly TItem[];
+  nextCursor: string | null;
+}
+
+async function collectStableProjection<
+  TResult extends { kind: string },
+  TItem,
+>(options: {
+  name: string;
+  sessionId: string;
+  start(): Promise<TResult>;
+  continue(
+    first: Exclude<TResult, { kind: 'revision_changed' }>,
+    cursor: string,
+  ): Promise<TResult>;
+  page(
+    result: TResult,
+    first: Exclude<TResult, { kind: 'revision_changed' }> | undefined,
+  ): StableProjectionPage<TResult, TItem>;
+}): Promise<{ first: Exclude<TResult, { kind: 'revision_changed' }>; items: TItem[] }> {
+  for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt += 1) {
+    const initial = await options.start();
+    if (initial.kind === 'revision_changed') throw invalidProjection(options.name);
+    const first = options.page(initial, undefined);
+    const items = [...first.items];
+    const cursors = new Set<string>();
+    let cursor = first.nextCursor;
+    let retry = false;
+    while (cursor !== null) {
+      if (cursors.has(cursor)) throw repeatedCursor(options.name);
+      cursors.add(cursor);
+      const result = await options.continue(first.source, cursor);
+      if (result.kind === 'revision_changed') {
+        retry = true;
+        break;
+      }
+      const page = options.page(result, first.source);
+      items.push(...page.items);
+      cursor = page.nextCursor;
+    }
+    if (!retry) return { first: first.source, items };
+  }
+  throw unstableProjection(options.name, options.sessionId);
+}
+
+function invalidProjection(name: string): DesktopRuntimeHostClientError {
+  return new DesktopRuntimeHostClientError(
+    'projection_unstable',
+    `Runtime Host returned an invalid ${name} projection`,
+  );
+}
+
+function repeatedCursor(name: string): DesktopRuntimeHostClientError {
+  return new DesktopRuntimeHostClientError(
+    'projection_unstable',
+    `Runtime Host repeated a ${name} cursor`,
+  );
+}
+
+function unstableProjection(name: string, sessionId: string): DesktopRuntimeHostClientError {
+  return new DesktopRuntimeHostClientError(
+    'projection_unstable',
+    `Runtime Host ${name} kept changing while Desktop read Session ${sessionId}`,
+  );
+}
+
+function createPricingReconciliationTarget(
+  base: DesktopPricingSnapshot,
+  mutation: PricingMutation,
+): PricingReconciliationTarget {
+  if (mutation.kind === 'upsert') return { kind: 'upsert', pricing: mutation.pricing };
+  const baseEntry = base.entries.find(({ pricing }) => pricing.modelKey === mutation.modelKey);
+  const expected =
+    baseEntry?.source === 'custom'
+      ? baseEntry.resetEffect === 'restore_builtin'
+        ? 'builtin'
+        : 'unpriced'
+      : 'no_override';
+  return { kind: 'delete', modelKey: mutation.modelKey, expected };
+}
+
+function pricingTargetMatchesSnapshot(
+  target: PricingReconciliationTarget,
+  snapshot: DesktopPricingSnapshot,
+): boolean {
+  const current = snapshot.entries.find(
+    ({ pricing }) => pricing.modelKey === pricingTargetModelKey(target),
+  );
+  if (target.kind === 'upsert') {
+    return (
+      current?.source === 'custom' &&
+      canonicalPricingConfigsEqual(current.pricing, target.pricing)
+    );
+  }
+  switch (target.expected) {
+    case 'builtin':
+      return current?.source === 'builtin';
+    case 'unpriced':
+      return current === undefined;
+    case 'no_override':
+      return current === undefined || current.source === 'builtin';
+  }
+}
+
+function pricingTargetModelKey(target: PricingReconciliationTarget): string {
+  return target.kind === 'upsert' ? target.pricing.modelKey : target.modelKey;
+}
+
+function pricingEntriesAreCanonical(entries: readonly EffectivePricingEntry[]): boolean {
+  return entries.every(
+    (entry, index) =>
+      index === 0 ||
+      comparePricingModelKeys(entries[index - 1]!.pricing.modelKey, entry.pricing.modelKey) < 0,
+  );
+}

@@ -162,6 +162,17 @@ export type SubagentSessionRuntimeSummary = Omit<
   'systemPrompt' | 'categoryPolicy'
 >;
 
+/**
+ * Client-facing child-session relation when the durable spawn record remains
+ * inside the Runtime Host authority boundary.
+ */
+export interface SessionSubagentProjection {
+  parentSessionId: string;
+  agentId?: string;
+  agentName?: string;
+  profile?: string;
+}
+
 export function isSessionStatus(value: unknown): value is SessionStatus {
   return typeof value === 'string' && (SESSION_STATUSES as readonly string[]).includes(value);
 }
@@ -289,6 +300,7 @@ export interface SessionSummary {
   runningTurnIds?: string[];
   parentSessionId?: string;
   branchOfTurnId?: string;
+  subagent?: SessionSubagentProjection;
   subagentParent?: SubagentSessionParent;
   subagentRuntime?: SubagentSessionRuntimeSummary;
   subagentWorkspace?: SubagentWorkspaceBinding;
@@ -489,11 +501,14 @@ export function childSessionsForParent(
   sessions: readonly SessionSummary[],
   parentSessionId: string,
 ): SessionSummary[] {
-  return sessions.filter(
-    (session) =>
-      isSubagentSessionParent(session.subagentParent) &&
-      session.subagentParent.parentSessionId === parentSessionId,
-  );
+  return sessions.filter((session) => linkedSubagentParentId(session) === parentSessionId);
+}
+
+/** Whether a Session is a linked child in either local or Host projection form. */
+export function isLinkedSubagentSession(
+  session: Pick<SessionSummary, 'subagent' | 'subagentParent'>,
+): boolean {
+  return linkedSubagentParentId(session) !== undefined;
 }
 
 /** Read-model projection; input order is preserved at every tree level. */
@@ -504,11 +519,9 @@ export function projectLinkedSessionTree(
   const sessionsById = new Map(sessions.map((session) => [session.id, session]));
   const nestedParentByChildId = new Map<string, string>();
   const linkedParentId = (session: SessionSummary): string | undefined => {
-    const relation = session.subagentParent;
-    if (!isSubagentSessionParent(relation)) return undefined;
-    return (
-      options.parentSessionIdAliases?.get(relation.parentSessionId) ?? relation.parentSessionId
-    );
+    const parentSessionId = linkedSubagentParentId(session);
+    if (!parentSessionId) return undefined;
+    return options.parentSessionIdAliases?.get(parentSessionId) ?? parentSessionId;
   };
 
   for (const session of sessions) {
@@ -537,6 +550,15 @@ export function projectLinkedSessionTree(
     roots,
     childrenByParentId: mutableChildren,
   };
+}
+
+function linkedSubagentParentId(
+  session: Pick<SessionSummary, 'subagent' | 'subagentParent'>,
+): string | undefined {
+  if (isSubagentSessionParent(session.subagentParent)) {
+    return session.subagentParent.parentSessionId;
+  }
+  return session.subagent?.parentSessionId;
 }
 
 /**
@@ -691,6 +713,8 @@ export interface AssistantMessage {
   turnId: string;
   ts: number;
   text: string;
+  /** Provider-owned text metadata such as Responses URL citations. */
+  providerOptions?: Record<string, unknown>;
   thinking?: AssistantThinking;
   /**
    * First-observed order of visible content inside this assistant step.
@@ -737,6 +761,7 @@ export interface ToolCallMessage {
   args: unknown;
   /** Provider-owned opaque call metadata retained for recovery backfill. */
   providerOptions?: Record<string, unknown>;
+  providerExecuted?: boolean;
   /**
    * Assistant step this call belongs to (equals the step's AssistantMessage
    * id, stamped from the same source as ToolStartEvent.stepId). Optional for
@@ -758,6 +783,9 @@ export interface ToolResultMessage {
   toolUseId: string;
   isError: boolean;
   content: ToolResultContent;
+  providerExecuted?: boolean;
+  /** Raw provider result retained only for provider-native replay. */
+  providerOutput?: unknown;
   durationMs?: number;
 }
 
@@ -876,15 +904,15 @@ const USER_MESSAGE_SHAPE = defineObjectShape<UserMessage>()(
 );
 const ASSISTANT_MESSAGE_SHAPE = defineObjectShape<AssistantMessage>()(
   ['type', 'id', 'turnId', 'ts', 'text', 'modelId'],
-  ['thinking', 'contentOrder'],
+  ['thinking', 'contentOrder', 'providerOptions'],
 );
 const TOOL_CALL_MESSAGE_SHAPE = defineObjectShape<ToolCallMessage>()(
   ['type', 'id', 'turnId', 'ts', 'toolName', 'args'],
-  ['activityKind', 'displayName', 'intent', 'providerOptions', 'stepId'],
+  ['activityKind', 'displayName', 'intent', 'providerOptions', 'providerExecuted', 'stepId'],
 );
 const TOOL_RESULT_MESSAGE_SHAPE = defineObjectShape<ToolResultMessage>()(
   ['type', 'id', 'turnId', 'ts', 'toolUseId', 'isError', 'content'],
-  ['durationMs'],
+  ['durationMs', 'providerExecuted', 'providerOutput'],
 );
 const PERMISSION_DECISION_MESSAGE_SHAPE = defineObjectShape<PermissionDecisionMessage>()(
   ['type', 'id', 'turnId', 'ts', 'toolUseId', 'toolName', 'decision'],
@@ -1008,6 +1036,7 @@ function decodeStoredMessage(
         hasMessageEnvelope(message, true) &&
         typeof message.text === 'string' &&
         typeof message.modelId === 'string' &&
+        (message.providerOptions === undefined || isRecord(message.providerOptions)) &&
         (message.thinking === undefined || isAssistantThinking(message.thinking)) &&
         (message.contentOrder === undefined ||
           (Array.isArray(message.contentOrder) &&
@@ -1028,6 +1057,7 @@ function decodeStoredMessage(
         isOptionalString(message.displayName) &&
         isOptionalString(message.intent) &&
         (message.providerOptions === undefined || isRecord(message.providerOptions)) &&
+        (message.providerExecuted === undefined || typeof message.providerExecuted === 'boolean') &&
         isOptionalString(message.stepId)
       )
         return message as unknown as ToolCallMessage;
@@ -1038,6 +1068,7 @@ function decodeStoredMessage(
         hasMessageEnvelope(message, true) &&
         typeof message.toolUseId === 'string' &&
         typeof message.isError === 'boolean' &&
+        (message.providerExecuted === undefined || typeof message.providerExecuted === 'boolean') &&
         isOptionalFiniteDuration(message.durationMs)
       )
         return message as unknown as ToolResultMessage;

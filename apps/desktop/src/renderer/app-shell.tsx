@@ -17,10 +17,10 @@ import type {
   UiLocalePreference,
 } from '@maka/core';
 import {
-  buildDeepResearchImplementationPrompt,
   collapseSessionRevisions,
   filterLinkedSessionTree,
   hasSettledInitialOnboarding,
+  isLinkedSubagentSession,
   parseGraphCommand,
   parseSwarmCommand,
   projectRevisionLinkedSessionTree,
@@ -47,7 +47,7 @@ import {
   enqueueInteraction,
   getConversationCopy,
   getSharedUiCopy,
-  reconcileSandboxBoundaryInteractions,
+  reconcileInteractions,
 } from '@maka/ui';
 import { useKeyboardHelp } from './keyboard-help';
 import { useCommandPalette } from './command-palette';
@@ -75,6 +75,10 @@ import {
 import { McpPage } from './mcp-page';
 import { getOnboardingActivationCandidate, useOnboardingSnapshot } from './use-onboarding-snapshot';
 import type { AppUpdateStatus, OnboardingSnapshot } from '../preload/bridge-contract.js';
+import {
+  isAppUpdateInstallFailure,
+  requestDownloadedAppUpdate,
+} from './app-update-install';
 import { ProviderLogo } from './settings/provider-display';
 import { ProviderBrandMark } from './settings/provider-brand-marks';
 import { getShellCopy, localizedShellErrorMessage } from './locales/shell-copy';
@@ -181,8 +185,6 @@ type ComposerImportOwner = {
  * assistant stream slot when the primary post-commit signal is missed.
  */
 const SETTLE_FALLBACK_GRACE_MS = 1000;
-const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
-
 /**
  * Module surfaces that own their whole column and render no workspace toolbar.
  * This used to be a `display: none` rule keyed on the detail panel's
@@ -240,6 +242,8 @@ function AppShellContent({
 }) {
   const toastApi = useToast();
   const [appUpdateStatus, setAppUpdateStatus] = useState<AppUpdateStatus | null>(null);
+  const updateInstallInFlightRef = useRef(false);
+  const notifiedInstallErrorRef = useRef<string | null>(null);
   const {
     sessions,
     authoritativeSessionIds,
@@ -276,11 +280,12 @@ function AppShellContent({
     setPendingSessionModelBySession,
     clearTurnTransientState,
   } = useAppShellSessionWorkspace(toastApi);
-  const sandboxBoundaryInteractionEpochRef = useRef(new Map<string, number>());
-  const markSandboxBoundaryInteractionChanged = useCallback((sessionId: string) => {
-    const epochs = sandboxBoundaryInteractionEpochRef.current;
+  const interactionHydrationEpochRef = useRef(new Map<string, number>());
+  const markInteractionChanged = useCallback((sessionId: string) => {
+    const epochs = interactionHydrationEpochRef.current;
     epochs.set(sessionId, (epochs.get(sessionId) ?? 0) + 1);
   }, []);
+
   const attachmentDraftKey = activeId ?? 'new-session';
   const {
     pendingAttachments,
@@ -378,33 +383,33 @@ function AppShellContent({
   const shellCopy = getShellCopy(uiLocale).app;
   const voiceCopy = getDesktopConversationCopy(uiLocale).voice;
   useEffect(() => {
+    if (!isAppUpdateInstallFailure(appUpdateStatus)) {
+      notifiedInstallErrorRef.current = null;
+      return;
+    }
+    if (notifiedInstallErrorRef.current === appUpdateStatus.message) return;
+    notifiedInstallErrorRef.current = appUpdateStatus.message;
+    toastApi.error(
+      shellCopy.updateInstallFailedTitle,
+      shellCopy.updateInstallManualFallback,
+    );
+  }, [appUpdateStatus, shellCopy, toastApi]);
+  useEffect(() => {
     let cancelled = false;
-    const refreshUpdateStatus = () => {
-      void window.maka.app
-        .checkForUpdates()
-        .then((next) => {
-          if (!cancelled) setAppUpdateStatus(next);
-        })
-        .catch(() => {
-          if (!cancelled) setAppUpdateStatus(null);
-        });
-    };
-
+    let receivedPush = false;
+    const unsubscribeUpdateStatus = window.maka.app.subscribeUpdateStatus((next) => {
+      receivedPush = true;
+      if (!cancelled) setAppUpdateStatus(next);
+    });
     void window.maka.app
       .updateStatus()
       .then((next) => {
-        if (!cancelled) setAppUpdateStatus(next);
+        if (!cancelled && !receivedPush) setAppUpdateStatus(next);
       })
       .catch(() => {});
-    const unsubscribeUpdateStatus = window.maka.app.subscribeUpdateStatus((next) => {
-      if (!cancelled) setAppUpdateStatus(next);
-    });
-    refreshUpdateStatus();
-    const interval = window.setInterval(refreshUpdateStatus, UPDATE_CHECK_INTERVAL_MS);
     return () => {
       cancelled = true;
       unsubscribeUpdateStatus();
-      window.clearInterval(interval);
     };
   }, []);
 
@@ -421,10 +426,21 @@ function AppShellContent({
     : undefined;
   const openUpdateDownload = useCallback(() => {
     if (appUpdateStatus?.state === 'downloaded') {
-      void window.maka.app
-        .installUpdate()
-        .then((result) => {
-          if (result.ok) return;
+      if (updateInstallInFlightRef.current) return;
+      updateInstallInFlightRef.current = true;
+      void requestDownloadedAppUpdate({
+        installUpdate: (input) => window.maka.app.installUpdate(input),
+        confirmActiveTasks: () => toastApi.confirm({
+          title: shellCopy.updateActiveTasksTitle,
+          description: shellCopy.updateActiveTasksDescription,
+          confirmLabel: shellCopy.updateActiveTasksConfirm,
+          cancelLabel: shellCopy.updateActiveTasksCancel,
+          destructive: true,
+        }),
+      })
+        .then((outcome) => {
+          if (outcome.kind !== 'failed') return;
+          if (outcome.reason === 'install_failed') return;
           toastApi.error(
             shellCopy.updateInstallFailedTitle,
             shellCopy.updateInstallManualFallback,
@@ -435,17 +451,30 @@ function AppShellContent({
             shellCopy.updateInstallFailedTitle,
             localizedShellErrorMessage(error, shellCopy.updateInstallFailedFallback, uiLocale),
           );
+        })
+        .finally(() => {
+          updateInstallInFlightRef.current = false;
         });
       return;
     }
-    if (appUpdateStatus?.state === 'available' || appUpdateStatus?.state === 'error') {
+    if (
+      appUpdateStatus?.state === 'available' ||
+      appUpdateStatus?.state === 'downloading' ||
+      appUpdateStatus?.state === 'error'
+    ) {
       void window.maka.app
-        .downloadUpdate()
-        .then((next) => setAppUpdateStatus(next))
+        .retryUpdateDownload()
+        .then((next) => {
+          if (next.state !== 'error') return;
+          toastApi.error(
+            shellCopy.updateRetryFailedTitle,
+            shellCopy.updateRetryFailedFallback,
+          );
+        })
         .catch((error) => {
           toastApi.error(
-            shellCopy.updateDownloadFailedTitle,
-            localizedShellErrorMessage(error, shellCopy.tryAgainLater, uiLocale),
+            shellCopy.updateRetryFailedTitle,
+            localizedShellErrorMessage(error, shellCopy.updateRetryFailedFallback, uiLocale),
           );
         });
       return;
@@ -497,6 +526,10 @@ function AppShellContent({
   const [paletteOpen, openPalette, closePalette] = useCommandPalette();
   const [viewMode, setViewMode] = useState<SessionViewMode>('conversation');
   const composerRef = useRef<ComposerHandle>(null);
+  // The rail's toggle has to reach Astryx's resizable state, not just this
+  // boolean — see the prop's note on SessionListPanel. The sidenav is mounted
+  // for the whole shell, so the handle is always live by the time it is called.
+  const sessionSideNavHandleRef = useRef<SideNavImperativeCollapseHandle | null>(null);
   // Codex-style quote side panel: a companion (fork of the main session) opened
   // from text selections in the transcript, surfaced as a transient workbar tab.
   // `quotes` accumulates excerpts staged for the next follow-up — selecting more
@@ -1043,22 +1076,25 @@ function AppShellContent({
     reading: activeExecutionBoundaryReading,
     reload: reloadActiveExecutionBoundary,
   } = useActiveExecutionBoundary(activeId, activeSessionForView?.permissionMode);
+  // The session view only subscribes to the session it shows, so a request
+  // raised while another session was active never reaches this surface as a
+  // live event — and neither does one raised before the window existed. The
+  // runtime holds every unanswered request, so read them back whenever the
+  // active session changes (#2072).
   useEffect(() => {
     if (!activeId) return;
     let cancelled = false;
-    const hydrationEpoch = sandboxBoundaryInteractionEpochRef.current.get(activeId) ?? 0;
+    const hydrationEpoch = interactionHydrationEpochRef.current.get(activeId) ?? 0;
     void window.maka.sessions
-      .listActiveSandboxBoundaryRequests(activeId)
+      .listActiveInteractions(activeId)
       .then((requests) => {
         if (
           cancelled ||
-          (sandboxBoundaryInteractionEpochRef.current.get(activeId) ?? 0) !== hydrationEpoch
+          (interactionHydrationEpochRef.current.get(activeId) ?? 0) !== hydrationEpoch
         ) {
           return;
         }
-        setInteractionBySession((current) =>
-          reconcileSandboxBoundaryInteractions(current, activeId, requests),
-        );
+        setInteractionBySession((current) => reconcileInteractions(current, activeId, requests));
       })
       .catch(() => {});
     return () => {
@@ -1184,7 +1220,6 @@ function AppShellContent({
     workbarTab,
     setWorkbarTab,
   } = useShellLayout();
-  const sessionSideNavHandleRef = useRef<SideNavImperativeCollapseHandle>(null);
 
   // The companion panel unmounts (and its fork is removed) when the workbar
   // collapses or the active session moves off the panel's source; clear the
@@ -1368,7 +1403,7 @@ function AppShellContent({
     setNavSelection,
     setLiveTurnBySession,
     setInteractionBySession,
-    onSandboxBoundaryInteractionChanged: markSandboxBoundaryInteractionChanged,
+    onInteractionChanged: markInteractionChanged,
     onExecutionBoundaryChanged: reloadActiveExecutionBoundary,
     showModelSetupToast,
     toastApi,
@@ -1721,7 +1756,7 @@ function AppShellContent({
     refreshSessions,
     setLiveTurnBySession,
     setInteractionBySession,
-    onSandboxBoundaryInteractionChanged: markSandboxBoundaryInteractionChanged,
+    onInteractionChanged: markInteractionChanged,
     onExecutionBoundaryChanged: reloadActiveExecutionBoundary,
     showModelSetupToast,
     toastApi,
@@ -1770,6 +1805,7 @@ function AppShellContent({
     clearSessionRendererState,
     createSession,
     handleConnectionEvent,
+    openHelp,
     openSettings,
     pendingPermissionModeChangesRef: permissionModeChangeRegistry.keysRef,
     pendingSessionModelChangesRef: sessionModelChangeRegistry.keysRef,
@@ -2047,7 +2083,7 @@ function AppShellContent({
       >
         <AppShellTopbarActions
           sidebarCollapsed={sessionListCollapsed}
-          sidebarHandleRef={sessionSideNavHandleRef}
+          onToggleSidebar={() => sessionSideNavHandleRef.current?.getCollapseState()?.toggle()}
           sidebarToggleHidden={settingsOpen}
           onOpenSearchModal={() => setSearchModalOpen(true)}
         />
@@ -2056,10 +2092,6 @@ function AppShellContent({
             workbarAvailable={navSelection.section === 'sessions' && Boolean(activeId)}
             workbarCollapsed={workbarCollapsed}
             onToggleWorkbar={() => setWorkbarCollapsed((current) => !current)}
-            onOpenFeedback={() => openSettingsSection('about')}
-            onOpenPalette={openPalette}
-            onOpenHelp={openHelp}
-            onOpenHealth={() => openSettingsSection('health')}
           />
         )}
       </header>
@@ -2191,7 +2223,7 @@ function AppShellContent({
                     {navSelection.section === 'sessions' &&
                     activeId &&
                     activeSessionForView &&
-                    !activeSessionForView.subagentParent ? (
+                    !isLinkedSubagentSession(activeSessionForView) ? (
                       <AgentGraphPanel
                         rootSessionId={activeId}
                         enabled={(activeSessionForView.orchestrationMode ?? 'default') === 'graph'}
@@ -2438,7 +2470,16 @@ function AppShellContent({
                   iterations: activeGoal.iterations,
                   maxIterations: activeGoal.maxIterations,
                             onClear: () => {
-                              void window.maka.goal.clear(activeGoal.sessionId);
+                              void window.maka.goal.clear(activeGoal.sessionId).catch((error) => {
+                                toastApi.error(
+                                  shellCopy.goalClearFailedTitle,
+                                  localizedShellErrorMessage(
+                                    error,
+                                    shellCopy.goalClearFailedFallback,
+                                    uiLocale,
+                                  ),
+                                );
+                              });
                             },
                           }
                         : undefined
@@ -2499,7 +2540,8 @@ function AppShellContent({
                     : undefined
                 }
                 onContinueDeepResearchHandoff={(run) => {
-                  const prompt = buildDeepResearchImplementationPrompt(run);
+                  const prompt = run.implementationPrompt;
+                  if (!prompt) return;
                   void createSession().then(() => {
                     window.requestAnimationFrame(() => {
                       composerRef.current?.setText(prompt);
@@ -2536,9 +2578,14 @@ function AppShellContent({
                 ) : null}
               </ChatSurfaceLayout>
             </div>
-            {navSelection.section === 'sessions' && activeId && !workbarCollapsed && (
+            {/* Rendered collapsed too: ChatWorkbar's own box is what the
+                collapse animates, and it has to be in the tree on both sides of
+                the toggle for there to be an animation at all. The column
+                inside it still unmounts. */}
+            {navSelection.section === 'sessions' && activeId && (
               <ChatWorkbar
                 activeId={activeId}
+                collapsed={workbarCollapsed}
                 browserLive={liveBrowserSessionIds.includes(activeId)}
                 hidden={hasModalOpen}
                 width={workbarWidth}
@@ -2578,6 +2625,7 @@ function AppShellContent({
         setUiLocalePreference={setUiLocalePreference}
         uiLocaleUpdateGate={uiLocaleUpdateGate}
         setUserLabel={setUserLabel}
+        setDefaultPermissionMode={setDefaultPermissionMode}
         settingsRequestedSection={settingsRequestedSection}
         settingsProviderCatalogOpen={settingsProviderCatalogOpen}
         settingsConnectionDetailSlug={settingsConnectionDetailSlug}
@@ -2586,6 +2634,7 @@ function AppShellContent({
           closeSettings();
           setNavSelection({ section: 'automations', module: 'daily-review' });
         }}
+        onOpenKeyboardHelp={openHelp}
         onOpenSettingsSession={(sessionId) => {
           closeSettings();
           openSessionInChat(sessionId);

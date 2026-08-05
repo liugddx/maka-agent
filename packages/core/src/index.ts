@@ -48,6 +48,7 @@ export type {
   ShellRunUpdate,
   SandboxDenialSignal,
   SandboxDenialRecovery,
+  ActiveInteractionRequestEvent,
   SandboxBoundaryRequestEvent,
   SandboxBoundaryDecisionAckEvent,
   AdditionalPermissionRequestEvent,
@@ -339,6 +340,7 @@ export type {
   SessionChangedReason,
   SessionStatus,
   SessionBlockedReason,
+  SessionSubagentProjection,
   SubagentSessionLifecycle,
   SubagentSessionParent,
   SubagentSessionRuntime,
@@ -373,6 +375,7 @@ export {
   deriveTurnRecords,
   isSessionStatus,
   isSessionBlockedReason,
+  isLinkedSubagentSession,
   isSubagentSessionParent,
   isSubagentSessionRuntime,
   isSubagentSessionSpawn,
@@ -672,6 +675,8 @@ export {
 // sandbox-boundary.ts
 export type {
   ExecutionBoundary,
+  ExecutionBoundaryReadModel,
+  ExecutionBoundarySummary,
   CreateSandboxBoundaryRequest,
   LegacyPermissionMode,
   SandboxBoundaryAccess,
@@ -1145,6 +1150,7 @@ export type {
   DeepResearchArtifactRole,
   DeepResearchChecklistItem,
   DeepResearchChecklistStatus,
+  DeepResearchClientProgress,
   DeepResearchChangedEvent,
   DeepResearchCheckpoint,
   DeepResearchEvent,
@@ -1178,6 +1184,11 @@ export {
   DEEP_RESEARCH_CHECKPOINTS_MAX,
   DEEP_RESEARCH_CHECKLIST_ITEMS_MAX,
   DEEP_RESEARCH_CHECKLIST_STATUSES,
+  DEEP_RESEARCH_CLIENT_IMPLEMENTATION_PROMPT_MAX_BYTES,
+  DEEP_RESEARCH_CLIENT_OBJECTIVE_MAX_BYTES,
+  DEEP_RESEARCH_CLIENT_PROGRESS_MAX_BYTES,
+  DEEP_RESEARCH_CLIENT_RECENT_ITEMS_MAX,
+  DEEP_RESEARCH_CLIENT_TEXT_MAX_BYTES,
   DEEP_RESEARCH_DEFAULT_CHECKLIST,
   DEEP_RESEARCH_EVENT_TYPES,
   DEEP_RESEARCH_INSPECTED_REFS_MAX,
@@ -1208,6 +1219,7 @@ export {
   normalizeDeepResearchObjective,
   projectDeepResearchEvents,
 } from './deep-research-run.js';
+export { projectDeepResearchClientProgress } from './deep-research-client-progress.js';
 
 // memory.ts (PR-MEMORY-1) — core contract; no IPC/storage/embedding/UI.
 export type {
@@ -1545,6 +1557,11 @@ export {
   resolveModelVisionSupport,
   resolveModelVoiceMetadata,
 } from './model-metadata.js';
+export type {
+  HostedWebSearchAdapter,
+  HostedWebSearchCapability,
+} from './model-web-search.js';
+export { resolveHostedWebSearchCapability } from './model-web-search.js';
 
 // settings.ts
 export type {
@@ -1687,6 +1704,7 @@ export {
 export {
   generalizedErrorMessage,
   generalizedErrorMessageChinese,
+  isAuthenticationErrorText,
   redactSecrets,
 } from './redaction.js';
 
@@ -1742,6 +1760,7 @@ export type {
   DailyReviewArchiveSummary,
   DailyReviewConfig,
   DailyReviewRange,
+  ParsedDailyReviewArchiveId,
   DailyReviewSectionKey,
   DailyReviewSessionRow,
   DailyReviewSummary,
@@ -1765,6 +1784,7 @@ export {
   localDayBoundsForInstant,
   normalizeDailyReviewConfig,
   normalizeDailyReviewArchive,
+  parseDailyReviewArchiveId,
   pickDailyReviewSessions,
   pickDailyReviewTopEntries,
 } from './daily-review.js';
@@ -1775,6 +1795,7 @@ export type {
   WebSearchErrorReason,
   WebSearchCredentialStatus,
   WebSearchCredentialSource,
+  WebSearchCredentialProvider,
   WebSearchProvider,
   WebSearchProviderSettings,
   WebSearchResponse,
@@ -1786,6 +1807,7 @@ export {
   WEB_SEARCH_DEFAULT_LIMIT,
   WEB_SEARCH_CREDENTIAL_STATUSES,
   WEB_SEARCH_CREDENTIAL_SOURCES,
+  WEB_SEARCH_CREDENTIAL_PROVIDERS,
   WEB_SEARCH_MAX_LIMIT,
   WEB_SEARCH_PROVIDERS,
   WEB_SEARCH_QUERY_MAX_CHARS,
@@ -1802,18 +1824,25 @@ export {
 } from './web-search.js';
 
 // explore-agent.ts — read-only deep research session profile.
-export type { SessionStartMode } from './explore-agent.js';
+export type { SessionStartMode, SessionStartModeSpec } from './explore-agent.js';
 export {
+  SESSION_START_MODES,
+  SESSION_START_MODE_LABELS,
+  SESSION_START_MODE_SPECS,
   DEEP_RESEARCH_EVIDENCE_CHECKLIST,
   DEEP_RESEARCH_IMPLEMENTATION_PROMPT_MAX_CHARS,
   DEEP_RESEARCH_PROGRESS_CHECKPOINTS,
   DEEP_RESEARCH_SESSION_LABEL,
+  DEEP_RESEARCH_SESSION_NAME,
   DEEP_RESEARCH_REPORT_SECTIONS,
   DEEP_RESEARCH_SCOPE_OPTIONS,
   DEEP_RESEARCH_STARTER_PROMPTS,
   DEEP_RESEARCH_WORKFLOW_STEPS,
   buildDeepResearchSystemPromptFragment,
   buildDeepResearchImplementationPrompt,
+  sessionStartModeSpec,
+  isSessionStartMode,
+  isSessionStartModeLabel,
   isDeepResearchSession,
 } from './explore-agent.js';
 

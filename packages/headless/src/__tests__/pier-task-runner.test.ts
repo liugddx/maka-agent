@@ -14,6 +14,7 @@ import {
   type TaskRunInput,
   type TaskRunOutput,
 } from '../fixed-prompt-controller.js';
+import { competitorRepoFiles } from '../agent-repo-mount.js';
 import { CODEX_TOOLCHAIN_FINGERPRINT, CODEX_TOOLCHAIN_SPEC } from '../codex-toolchain.js';
 import { OPENCODE_TOOLCHAIN_FINGERPRINT, OPENCODE_TOOLCHAIN_SPEC } from '../opencode-toolchain.js';
 import { findTrialDir, MAKA_SETTLEMENT_GRACE_SEC } from '../harbor-task-runner.js';
@@ -491,6 +492,50 @@ test('createPierTaskRunner mounts the pinned Maka Node runtime for container tas
       ),
     );
     assert.ok(args.includes(`MAKA_NODE_TOOLCHAIN_FINGERPRINT=${MAKA_NODE_TOOLCHAIN_FINGERPRINT}`));
+  });
+});
+
+test('createPierTaskRunner withholds the repo tree from a competitor arm', async () => {
+  await withDirs(async ({ jobsDir, repo }) => {
+    const repoMountsFor = async (agent: 'maka' | 'codex') => {
+      const captured: FakeOptions['captured'] = {};
+      const runner = createPierTaskRunner(
+        baseOptions({
+          jobsDir,
+          makaRepoPath: repo,
+          agent,
+          agentVersion: CODEX_TOOLCHAIN_SPEC.codex.version,
+          codexToolchainPath: '/toolchains/codex',
+          ...(agent === 'codex'
+            ? {
+                backend: 'ai-sdk' as const,
+                provider: 'openai-codex' as const,
+                model: 'gpt-5.6-sol',
+                resolveProviderCredential: () => Promise.resolve({ value: 'upstream-key' }),
+                providerProxyPort: 0,
+              }
+            : {}),
+          runPier: fakePier({ reward: 0, captured }),
+        }),
+      );
+      await runner(runInput());
+      const args = captured.request?.args ?? [];
+      const mounts = JSON.parse(args[args.indexOf('--mounts-json') + 1]!) as Array<{
+        target: string;
+      }>;
+      return mounts.filter((mount) => mount.target.startsWith('/opt/maka-agent'));
+    };
+
+    assert.ok((await repoMountsFor('maka')).some((mount) => mount.target === '/opt/maka-agent'));
+
+    // Pier shares agent-repo-mount with the Harbor runner precisely so this
+    // cannot regress in one executor while the other stays fixed.
+    const competitor = await repoMountsFor('codex');
+    assert.ok(competitor.every((mount) => mount.target !== '/opt/maka-agent'));
+    assert.deepEqual(
+      competitor.map((mount) => mount.target),
+      competitorRepoFiles('codex').map((file) => `/opt/maka-agent/${file}`),
+    );
   });
 });
 
@@ -985,6 +1030,130 @@ test('createPierTaskRunner recovers execution identity from a budget-exhausted t
     await assert.rejects(runner(runInput()), (error: Error) => {
       assert.ok(error instanceof FixedPromptBudgetExhaustedError);
       assert.deepEqual(error.artifactRefs?.executionIdentity, identity);
+      return true;
+    });
+  });
+});
+
+test('createPierTaskRunner carries the verifier grade of a budget-exhausted trial without cell output', async () => {
+  await withDirs(async ({ jobsDir, repo }) => {
+    const runner = createPierTaskRunner(
+      baseOptions({
+        jobsDir,
+        makaRepoPath: repo,
+        runPier: fakePier({
+          cell: null,
+          reward: 1,
+          exceptionInfo: {
+            exception_type: 'AgentTimeoutError',
+            exception_message: 'Agent execution timed out after 600 seconds',
+          },
+        }),
+      }),
+    );
+    await assert.rejects(runner(runInput()), (error: Error) => {
+      assert.ok(error instanceof FixedPromptBudgetExhaustedError);
+      assert.equal(error.artifactRefs?.harbor?.reward, 1);
+      assert.equal(error.artifactRefs?.harbor?.verifier?.outcome, 'passed');
+      return true;
+    });
+  });
+});
+
+// The grade travels only from a graded state. `invalid` (corrupt or crashed
+// verifier) and `ungraded` (no reward at all) are not verdicts, so a budget
+// exhaustion carries no score — the same negative side the Harbor table pins.
+for (const trial of [
+  { name: 'a crash-sentinel reward', opts: { reward: -1 } },
+  { name: 'a corrupt reward.json', opts: { rewardJsonRaw: 'not-json{' } },
+  { name: 'no reward at all', opts: {} },
+] as const) {
+  test(`createPierTaskRunner carries no verdict from a budget-exhausted trial with ${trial.name}`, async () => {
+    await withDirs(async ({ jobsDir, repo }) => {
+      const runner = createPierTaskRunner(
+        baseOptions({
+          jobsDir,
+          makaRepoPath: repo,
+          runPier: fakePier({
+            ...trial.opts,
+            cell: null,
+            exceptionInfo: {
+              exception_type: 'AgentTimeoutError',
+              exception_message: 'Agent execution timed out after 600 seconds',
+            },
+          }),
+        }),
+      );
+      await assert.rejects(runner(runInput()), (error: Error) => {
+        assert.ok(error instanceof FixedPromptBudgetExhaustedError);
+        assert.equal(error.artifactRefs?.harbor, undefined);
+        return true;
+      });
+    });
+  });
+}
+
+test('createPierTaskRunner withholds a budget-exhausted grade when the provider cut the tail short', async () => {
+  await withDirs(async ({ jobsDir, repo }) => {
+    const makeRunner = (outcome: ProviderRequestTelemetry['outcome']) =>
+      createPierTaskRunner(
+        baseOptions({
+          jobsDir,
+          makaRepoPath: repo,
+          agent: 'opencode',
+          agentVersion: OPENCODE_TOOLCHAIN_SPEC.opencode.version,
+          backend: 'ai-sdk',
+          provider: 'deepseek',
+          model: 'deepseek-v4-flash',
+          reasoningEffort: 'max',
+          opencodeToolchainPath: repo,
+          apiKeyFile: '/secrets/deepseek.key',
+          providerProxyHub: {
+            baseUrl: 'http://host.docker.internal:443',
+            issue: () => ({
+              baseUrl: 'http://host.docker.internal:443',
+              token: 'ephemeral-token',
+              usage: () => null,
+              telemetry: () => [
+                {
+                  requestId: 1,
+                  method: 'POST',
+                  path: '/chat/completions',
+                  status: 200,
+                  outcome,
+                  durationMs: 5,
+                  bodyChunks: 1,
+                  responseBytes: 64,
+                  terminalEvent: outcome === 'completed',
+                },
+              ],
+              close: async () => {},
+            }),
+            close: async () => {},
+          },
+          runPier: fakePier({
+            reward: 1,
+            cell: null,
+            exceptionInfo: {
+              exception_type: 'AgentTimeoutError',
+              exception_message: 'Agent execution timed out after 600 seconds',
+            },
+          }),
+        }),
+      );
+
+    // The agent tearing its own request down on the way out is what a deadline
+    // looks like from the proxy, so the verdict still travels.
+    await assert.rejects(makeRunner('aborted')(runInput()), (error: Error) => {
+      assert.ok(error instanceof FixedPromptBudgetExhaustedError);
+      assert.equal(error.artifactRefs?.harbor?.reward, 1);
+      return true;
+    });
+    // An upstream truncation is a provider outage: the agent never got the run
+    // it was given, so its verdict is not this arm's evidence.
+    await assert.rejects(makeRunner('interrupted')(runInput()), (error: Error) => {
+      assert.ok(error instanceof FixedPromptBudgetExhaustedError);
+      assert.equal(error.artifactRefs?.harbor, undefined);
       return true;
     });
   });
@@ -1694,6 +1863,9 @@ test('createPierTaskRunner rejects a Pier cell whose terminal provider stream is
     // A completed terminal request takes the normal reward path.
     const output = await makeRunner('completed')(runInput());
     assert.equal(output.harbor.reward, 0);
+    // So does a tail the agent tore down itself on its way out: the trial
+    // raised nothing and the verifier graded it, so the cell is evidence.
+    assert.equal((await makeRunner('aborted')(runInput())).harbor.reward, 0);
   });
 });
 

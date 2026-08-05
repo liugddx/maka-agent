@@ -1,4 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import {
+  buildDeepResearchSystemPromptFragment,
+  isDeepResearchSession,
+} from '@maka/core/explore-agent';
 import { resolveModelVisionSupport } from '@maka/core/model-metadata';
 import { activePlanExecution, type PlanSessionState, type PlanStore } from '@maka/core/plan';
 import type { ModelCallAttempt } from '@maka/core/model-call-attempt';
@@ -17,6 +21,7 @@ import {
   buildLlmHistorySummarizer,
   buildPersonalizationPromptFragment,
   buildCancelPlanTool,
+  buildParentAgentTools,
   buildPricingLookup,
   buildProviderOptions,
   buildSubmitPlanTool,
@@ -30,8 +35,11 @@ import {
   createProviderRequestCaptureRecorder,
   createProxiedFetchTransport,
   getAIModel,
+  isDeepResearchToolAllowed,
+  listRunnableBuiltinAgentDefinitions,
   projectEffectiveProductToolSurface,
   recordToolInvocation,
+  routeWebSearchTools,
   resolveProjectGitInfo,
   resolveSelectedModelContextWindow,
   renderInterruptedPlanContext,
@@ -119,6 +127,9 @@ export interface HostExecutionModelCompositionInput {
     readonly state: PlanSessionState;
     readonly mode: 'agent' | 'plan';
   };
+  readonly deepResearch?: {
+    readonly tools: readonly MakaTool[];
+  };
 }
 
 /** Composes one Host-owned prompt and pure tool surface from canonical authorities. */
@@ -137,9 +148,13 @@ export function createHostExecutionModelComposition(
         input.goalTools,
         input.parentAgentTools,
         input.plan,
+        input.deepResearch?.tools,
       );
   const clientCapabilityTools = input.boundTools ? [] : (input.clientCapabilities?.tools ?? []);
-  const candidateTools = [...defaultTools, ...clientCapabilityTools];
+  const unscopedCandidateTools = [...defaultTools, ...clientCapabilityTools];
+  const candidateTools = input.deepResearch
+    ? unscopedCandidateTools.filter(isDeepResearchToolAllowed)
+    : unscopedCandidateTools;
   const activeExecution = input.plan ? activePlanExecution(input.plan.state) : undefined;
   const selectedTools = input.plan
     ? selectCollaborationTools({
@@ -208,6 +223,11 @@ export function createHostExecutionModelComposition(
         workspaceInstructions,
         promptState.memory,
         input.plan?.mode === 'plan' ? renderPlanModePrompt() : undefined,
+        input.deepResearch
+          ? buildDeepResearchSystemPromptFragment({
+              exploreAgentAvailable: tools.some(({ name }) => name === 'ExploreAgent'),
+            })
+          : undefined,
       ]);
     },
     turnTailPrompt: async (context: HostModelPromptContext) => {
@@ -255,8 +275,11 @@ export interface HostAiSdkBackendInput {
   readonly automationTool?: MakaTool;
   readonly goalTools?: readonly MakaTool[];
   readonly parentAgentTools?: readonly MakaTool[];
+  readonly childTools?: readonly MakaTool[];
+  readonly worktreePatchWriteBackAvailable?: boolean;
   readonly childAgents?: HostChildAgentBackendCapabilities;
   readonly planStore?: PlanStore;
+  readonly deepResearchTools?: readonly MakaTool[];
   readonly createFetchTransport?: (proxy: ProxiedFetchProxy | null) => ProxiedFetchTransport;
 }
 
@@ -278,6 +301,10 @@ export async function createHostAiSdkBackend(input: HostAiSdkBackendInput): Prom
     input.context.abortSignal,
   );
   const pricing = buildPricingLookup(pricingSnapshot.overrides);
+  const runtimePolicySnapshot = await readDuringBackendCreation(
+    () => input.runtimePolicy.runtimePolicy.getSnapshot(),
+    input.context.abortSignal,
+  );
   const transport = createFetchTransport(
     toRuntimePolicyProxy(target.networkProxy, target.proxySecret),
   );
@@ -330,20 +357,49 @@ export async function createHostAiSdkBackend(input: HostAiSdkBackendInput): Prom
             input.context.abortSignal,
           )
         : [];
-    const hostTools = [...(input.hostTools ?? []), ...rootTools];
+    const candidateHostTools = [...(input.hostTools ?? []), ...rootTools];
+    const webSearchRouting = {
+      tools: candidateHostTools,
+      settings: runtimePolicySnapshot.policy.webSearch,
+      connection: target.connection,
+      model: target.model,
+      privacy: runtimePolicySnapshot.policy.privacy,
+    } as const;
+    const hostTools = routeWebSearchTools(webSearchRouting);
+    const boundTools = input.context.tools
+      ? routeWebSearchTools({
+          ...webSearchRouting,
+          tools: input.context.tools,
+        })
+      : undefined;
+    const routedChildTools = input.childTools
+      ? routeWebSearchTools({
+          ...webSearchRouting,
+          tools: input.childTools,
+        })
+      : undefined;
+    const parentAgentTools = routedChildTools
+      ? buildParentAgentTools({
+          taskLedger: input.taskLedger,
+          definitions: listRunnableBuiltinAgentDefinitions({
+            tools: routedChildTools,
+            worktreeChildExecutorAvailable: input.worktreePatchWriteBackAvailable,
+          }),
+        })
+      : input.parentAgentTools;
     modelComposition = createHostExecutionModelComposition({
       policy: input.runtimePolicy.runtimePolicy,
       skills: input.skills,
       memory: input.memory,
       taskLedger: input.taskLedger,
       ...(input.context.systemPrompt ? { childInstruction: input.context.systemPrompt } : {}),
-      ...(input.context.tools ? { boundTools: input.context.tools } : {}),
+      ...(boundTools ? { boundTools } : {}),
       ...(clientCapabilities ? { clientCapabilities } : {}),
       ...(input.builtinTools ? { builtinTools: input.builtinTools } : {}),
       ...(hostTools.length > 0 ? { hostTools } : {}),
       ...(input.automationTool ? { automationTool: input.automationTool } : {}),
       ...(input.goalTools ? { goalTools: input.goalTools } : {}),
-      ...(input.parentAgentTools ? { parentAgentTools: input.parentAgentTools } : {}),
+      ...(parentAgentTools ? { parentAgentTools } : {}),
       ...(planState && input.planStore
         ? {
             plan: {
@@ -352,6 +408,9 @@ export async function createHostAiSdkBackend(input: HostAiSdkBackendInput): Prom
               mode: input.context.header.collaborationMode ?? 'agent',
             },
           }
+        : {}),
+      ...(isDeepResearchSession(input.context.header.labels) && !input.context.tools
+        ? { deepResearch: { tools: requireDeepResearchTools(input.deepResearchTools) } }
         : {}),
       skillBudget: {
         contextWindow: resolveSelectedModelContextWindow(target.connection, target.model),
@@ -630,6 +689,7 @@ function buildDefaultHostTools(
   goalTools: readonly MakaTool[] = [],
   parentAgentTools: readonly MakaTool[] = [],
   plan?: HostExecutionModelCompositionInput['plan'],
+  deepResearchTools: readonly MakaTool[] = [],
 ): MakaTool[] {
   const builtins = builtinOptions ? buildBuiltinTools(builtinOptions) : [];
   const question = buildAskUserQuestionTool();
@@ -659,6 +719,7 @@ function buildDefaultHostTools(
     ...goalTools.map((tool) => tool.name),
     ...parentAgentTools.map((tool) => tool.name),
     ...planTools.map((tool) => tool.name),
+    ...deepResearchTools.map((tool) => tool.name),
   ];
   const skillHost = buildHostCapabilitiesFromBinding(toolNames);
   const shadowTracker = new SkillShadowSelectionTracker();
@@ -677,7 +738,13 @@ function buildDefaultHostTools(
     ...goalTools,
     ...parentAgentTools,
     ...planTools,
+    ...deepResearchTools,
   ];
+}
+
+function requireDeepResearchTools(tools: readonly MakaTool[] | undefined): readonly MakaTool[] {
+  if (!tools) throw new Error('Runtime Host Deep Research tools are not composed');
+  return tools;
 }
 
 function renderPlanTail(state: PlanSessionState, mode: 'agent' | 'plan'): string | undefined {

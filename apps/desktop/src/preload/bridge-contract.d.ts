@@ -7,11 +7,11 @@ import type {
   BotOnboardingSnapshot,
   BotOnboardingStartInput,
   HealthSnapshot,
-  ExecutionBoundary,
+  ExecutionBoundaryReadModel,
   LlmConnection,
   ModelDiscoveryResult,
   ModelInfo,
-  SandboxBoundaryRequestEvent,
+  ActiveInteractionRequestEvent,
   SandboxBoundaryResponse,
   UserQuestionResponse,
   PermissionMode,
@@ -76,7 +76,7 @@ import type {
   Task,
   TaskLedgerChangedEvent,
   DeepResearchChangedEvent,
-  DeepResearchRun,
+  DeepResearchClientProgress,
   LocalMemoryEntryPreview,
 } from '@maka/core';
 import type { SessionTrace } from '@maka/core/session-trace';
@@ -173,7 +173,30 @@ export type AppUpdateStatus =
       releaseName?: string;
       downloadedFile?: string;
     }
-  | { state: 'error'; currentVersion: string; message: string; latestVersion?: string };
+  | { state: 'installing'; currentVersion: string; latestVersion: string }
+  | {
+      state: 'error';
+      currentVersion: string;
+      message: string;
+      operation: 'check' | 'download' | 'install';
+      latestVersion?: string;
+    };
+
+export type AppUpdateInstallRequest = {
+  /** User consent from the trusted desktop renderer; this is a UX boundary, not a security boundary. */
+  allowInterruptActiveTasks: boolean;
+};
+
+export type AppUpdateInstallResult =
+  | { ok: true }
+  | { ok: false; reason: 'active_tasks' }
+  | { ok: false; reason: 'not_downloaded' | 'install_failed' };
+
+/**
+ * Commands dispatched by the native application menu (see
+ * main/application-menu.ts). The renderer owns the implementations.
+ */
+export type WindowCommand = { id: 'newTask' | 'openSettings' | 'openHelp' };
 
 export interface MakaBridge {
 
@@ -182,7 +205,7 @@ export interface MakaBridge {
     subscribeChanges(handler: (event: TaskLedgerChangedEvent) => void): () => void;
   };
   deepResearch: {
-    get(sessionId: string): Promise<DeepResearchRun | undefined>;
+    get(sessionId: string): Promise<DeepResearchClientProgress | undefined>;
     subscribeChanges(handler: (event: DeepResearchChangedEvent) => void): () => void;
   };
   graphs: {
@@ -238,10 +261,8 @@ export interface MakaBridge {
     stop(sessionId: string, input?: { source?: 'stop_button' }): Promise<void>;
     steer(sessionId: string, text: string): Promise<QueueEnqueueOutcome>;
     readMessages(sessionId: string): Promise<StoredMessage[]>;
-    readExecutionBoundary(sessionId: string): Promise<ExecutionBoundary>;
-    listActiveSandboxBoundaryRequests(
-      sessionId: string,
-    ): Promise<SandboxBoundaryRequestEvent[]>;
+    readExecutionBoundary(sessionId: string): Promise<ExecutionBoundaryReadModel>;
+    listActiveInteractions(sessionId: string): Promise<ActiveInteractionRequestEvent[]>;
     listTurns(sessionId: string): Promise<TurnRecord[]>;
     compact(sessionId: string): Promise<void>;
     resumeLatest(sessionId: string): Promise<
@@ -269,6 +290,7 @@ export interface MakaBridge {
     setCollaborationMode(sessionId: string, mode: CollaborationMode): Promise<SessionSummary>;
     setOrchestrationMode(sessionId: string, mode: OrchestrationMode): Promise<SessionSummary>;
     getPlanState(sessionId: string): Promise<PlanSessionState>;
+    subscribePlanChanges(sessionId: string, handler: () => void): () => void;
     requestPlanRevision(sessionId: string, proposalId: string): Promise<PlanSessionState>;
     abandonPlanProposal(
       sessionId: string,
@@ -277,10 +299,10 @@ export interface MakaBridge {
     approvePlan(sessionId: string, input: {
       proposalId: string;
       expectedRevision: number;
-      expectedStoreVersion?: number;
-    }): Promise<{ state: PlanSessionState; turnId: string; executionId: string }>;
-    resumePlan(sessionId: string, executionId: string): Promise<{
-      state: PlanSessionState;
+      expectedStoreVersion: number;
+      turnId: string;
+    }): Promise<{ turnId: string; executionId: string }>;
+    resumePlan(sessionId: string, executionId: string, turnId: string): Promise<{
       turnId: string;
       executionId: string;
     }>;
@@ -592,6 +614,9 @@ export interface MakaBridge {
     // PR-SHOW-AFTER-FIRST-COMMIT: signal main after the first React commit
     // so the hidden window is revealed (see main-window.ts).
     notifyRendererReady(): Promise<void>;
+    // PR-2088: main-to-renderer route for native-menu commands. Returns an
+    // unsubscribe; a command sent before this subscription exists is dropped.
+    subscribeCommand(handler: (command: WindowCommand) => void): () => void;
   };
   config: {
     export(input: { categories: ConfigCategory[] }): Promise<
@@ -630,9 +655,8 @@ export interface MakaBridge {
     }>;
     subscribeUpdateStatus(handler: (status: AppUpdateStatus) => void): () => void;
     updateStatus(): Promise<AppUpdateStatus>;
-    checkForUpdates(): Promise<AppUpdateStatus>;
-    downloadUpdate(): Promise<AppUpdateStatus>;
-    installUpdate(): Promise<{ ok: true } | { ok: false; reason: 'not_downloaded' | 'install_failed' }>;
+    retryUpdateDownload(): Promise<AppUpdateStatus>;
+    installUpdate(input: AppUpdateInstallRequest): Promise<AppUpdateInstallResult>;
     openUpdateDownload(): Promise<{ ok: true } | { ok: false; reason: 'not_available' | 'open_failed' }>;
     sessionProjectInfo(sessionId: string): Promise<{
       projectPath: string;

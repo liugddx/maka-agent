@@ -16,6 +16,7 @@ import {
 import { ArrowLeft } from '@maka/ui/icons';
 import type {
   AppSettings,
+  ChatDefaultPermissionMode,
   LlmConnection,
   ProviderType,
   SettingsSection,
@@ -66,12 +67,14 @@ export function SettingsSurface(props: {
   onUiLocalePreferenceChange(preference: UiLocalePreference): void;
   uiLocaleUpdateGate: UiLocaleUpdateGate;
   onUserLabelChange?(label: string): void;
+  onDefaultPermissionModeChange(mode: ChatDefaultPermissionMode): void;
   requestedSection?: SettingsSection;
   openProviderCatalog?: boolean;
   initialConnectionSlug?: string;
   initialCreateProviderType?: ProviderType;
   initialFocusRef: RefObject<HTMLButtonElement | null>;
   onOpenDailyReview?(): void;
+  onOpenKeyboardHelp?(): void;
   onOpenSession?(sessionId: string): void;
 }) {
   const locale = useUiLocale();
@@ -201,6 +204,12 @@ export function SettingsSurface(props: {
         next.personalization.uiLocale,
         props.onUiLocalePreferenceChange,
       );
+      if (patch.chatDefaults?.permissionMode !== undefined) {
+        // The empty composer lives outside Settings and mirrors this value.
+        // Update it from the committed result even if Settings closed while
+        // the save was in flight; a close-time re-read can race the write.
+        props.onDefaultPermissionModeChange(next.chatDefaults.permissionMode);
+      }
       if (settingsModalMountedRef.current && ticket === settingsUpdateTicketRef.current) {
         setSettings(next);
         props.onUserLabelChange?.(next.personalization.displayName);
@@ -354,6 +363,7 @@ export function SettingsSurface(props: {
                       onThemeChange={props.onThemeChange}
                       onThemePaletteChange={props.onThemePaletteChange}
                       onOpenDailyReview={props.onOpenDailyReview}
+                      onOpenKeyboardHelp={props.onOpenKeyboardHelp}
                       onOpenSession={props.onOpenSession}
                       openProviderCatalog={providerCatalogRequested}
                       initialConnectionSlug={props.initialConnectionSlug}
@@ -386,6 +396,7 @@ function SettingsPageBody(props: {
   onThemeChange(pref: ThemePreference): void;
   onThemePaletteChange(palette: ThemePalette): void;
   onOpenDailyReview?(): void;
+  onOpenKeyboardHelp?(): void;
   onOpenSession?(sessionId: string): void;
   openProviderCatalog?: boolean;
   initialConnectionSlug?: string;
@@ -440,7 +451,7 @@ function SettingsPageBody(props: {
         />
       );
     case 'about':
-      return <AboutSettingsPage />;
+      return <AboutSettingsPage onOpenKeyboardHelp={props.onOpenKeyboardHelp} />;
     case 'general':
       return (
         <GeneralSettingsPage

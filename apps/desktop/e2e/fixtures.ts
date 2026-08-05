@@ -22,6 +22,25 @@ const DESKTOP_ROOT = process.cwd();
 export const COMPOSER_INPUT = '.maka-composer-editor [contenteditable="true"]';
 
 /**
+ * Wait for Runtime's authoritative Skill projection, not merely for the
+ * composer DOM to mount. The renderer requests this projection after its first
+ * render, so a visible editor can still have an empty `/` source during cold
+ * start.
+ */
+export async function waitForInvocableSkills(
+  page: Page,
+  expectedIds: readonly string[],
+): Promise<void> {
+  await expect
+    .poll(async () =>
+      page.evaluate(async () =>
+        (await window.maka.skills.listInvocable(undefined)).map((skill) => skill.id),
+      ),
+    )
+    .toEqual(expect.arrayContaining(expectedIds));
+}
+
+/**
  * Pre-seed a real-looking connection into the throwaway workspace so onboarding
  * clears and the composer is enabled. Actual sessions still run on the fake
  * backend (BackendRegistry override in main); this only satisfies the UI
@@ -210,6 +229,9 @@ async function withE2eWindow(
     // Centralize the cold-start wait so test bodies are flake-free under retries:0.
     try {
       await page.waitForSelector(readinessSelector, { timeout: 20_000 });
+      if (invocableSkills) {
+        await waitForInvocableSkills(page, ['project-only', 'workspace-only']);
+      }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       const mainDetail = mainLogs.length > 0 ? `\nElectron main console:\n${mainLogs.join('\n')}` : '';
@@ -370,7 +392,15 @@ export const test = base.extend<{
   // workspace so its shell controls and peer tabs run against real IPC data.
   sessionWorkbarWindow: async ({}, use) => {
     await withE2eWindow(
-      { seed: false, readinessSelector: 'aside[aria-label="会话工作栏"]', e2eFixtureScenario: 'task-ledger', locale: 'zh' },
+      {
+        seed: false,
+        // The data contract, not the tag: the panel's surface is an Astryx Card
+        // (a div carrying role="complementary"), so a tag-anchored selector
+        // would pin an implementation detail the design system owns.
+        readinessSelector: '[data-maka-contract="session-workbar"]',
+        e2eFixtureScenario: 'task-ledger',
+        locale: 'zh',
+      },
       use,
     );
   },
@@ -402,7 +432,7 @@ export const test = base.extend<{
     await withE2eWindow(
       {
         seed: false,
-        readinessSelector: '.maka-plan-list-row',
+        readinessSelector: '.maka-module-page-rows',
         e2eFixtureScenario: 'plan-reminders',
         locale: 'zh',
       },

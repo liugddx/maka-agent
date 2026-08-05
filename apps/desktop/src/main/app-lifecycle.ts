@@ -37,7 +37,9 @@ import type { DesktopExecutionStoreWiring } from './execution-store-wiring.js';
 import type { assembleDesktopTools } from './tool-assembly.js';
 import type { StreamEvents } from './session-stream.js';
 import type { SettingsIpcHandle } from './settings-ipc-main.js';
+import type { AppUpdateService } from './app-update-service.js';
 import { createAppQuitCoordinator } from './app-quit-coordinator.js';
+import { installApplicationMenu } from './application-menu.js';
 import { resolveDockPresentation } from './dock-presentation.js';
 import { resumeSafeBoundaryContinuationsOnStartup } from './startup-safe-boundary-resume.js';
 import { retireCursorSubscriptionCredentials } from './oauth/cursor-subscription-retirement.js';
@@ -67,6 +69,7 @@ export interface AppLifecycleDeps {
   botRegistry: BotRegistry;
   planReminders: ReturnType<typeof createPlanReminderMainService>;
   dailyReview: ReturnType<typeof createDailyReviewMainService>;
+  updateService: AppUpdateService;
   automationWiring: ReturnType<typeof createMainAutomationWiring>;
   goalWiring: ReturnType<typeof createMainGoalWiring>;
   computerUse: AssembledTools['computerUse'];
@@ -140,6 +143,7 @@ export function wireAppLifecycle(deps: AppLifecycleDeps): void {
     botRegistry,
     planReminders,
     dailyReview,
+    updateService,
     automationWiring,
     goalWiring,
     computerUse,
@@ -254,6 +258,7 @@ export function wireAppLifecycle(deps: AppLifecycleDeps): void {
         }
       }
     }
+    updateService.start();
 
     // The renderer's first IPC calls (session enumeration, settings read,
     // connection listing)
@@ -267,6 +272,28 @@ export function wireAppLifecycle(deps: AppLifecycleDeps): void {
     // here after store construction would detach the canonical database.
     const initialWindowSignal = quitCoordinator.getWindowCreationSignal();
     if (!initialWindowSignal) return;
+    // The application menu is app-scoped, not window-scoped: install it once
+    // here (before the first window, surviving window close on macOS) instead
+    // of inside createWindow. A null menu on macOS leaves Cmd+Q and the Edit
+    // roles without any handler; Windows/Linux keep it suppressed so the
+    // renderer's shell chrome and Ctrl+N / Ctrl+, shortcuts stay untouched.
+    // Menu commands route to the renderer through one typed channel when a
+    // window exists, or re-create the window when there is none (quit-phase
+    // no-op via the coordinator).
+    installApplicationMenu({
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+      dispatch: (command) => {
+        if (mainWindowController.hasOpenWindows()) {
+          mainWindowController.send('window:command', { id: command });
+        } else {
+          // Deliberately drop the command: re-creating the window is what the
+          // user asked for by acting on the menu, and replaying stale commands
+          // after startup would be surprising (accepted trade-off, #2088).
+          quitCoordinator.focusOrCreateWindow();
+        }
+      },
+    });
     app.on('second-instance', quitCoordinator.focusOrCreateWindow);
     app.on('activate', quitCoordinator.focusOrCreateWindow);
     backgroundStartup = runBackgroundStartup();
@@ -361,6 +388,7 @@ export function wireAppLifecycle(deps: AppLifecycleDeps): void {
   app.on('before-quit', quitCoordinator.handleBeforeQuit);
 
   async function runBeforeQuitCleanup(): Promise<void> {
+    updateService.dispose();
     try {
       await backgroundStartup;
     } catch (error) {

@@ -450,6 +450,8 @@ export interface TextCompleteEvent extends BaseEvent {
   type: 'text_complete';
   messageId: string;
   text: string;
+  /** Provider-owned text metadata such as Responses URL citations. */
+  providerOptions?: Record<string, unknown>;
 }
 
 export interface ThinkingDeltaEvent extends BaseEvent {
@@ -479,6 +481,8 @@ export interface ToolStartEvent extends BaseEvent {
   args: unknown;
   /** Provider-owned opaque call metadata that must survive model replay. */
   providerOptions?: Record<string, unknown>;
+  /** True when the provider executed the tool inside the model request. */
+  providerExecuted?: boolean;
   displayName?: string;
   intent?: string;
   /**
@@ -525,6 +529,10 @@ export interface ToolResultEvent extends BaseEvent {
   toolUseId: string;
   /** Runtime-owned durable tool-operation identity (Phase 2). */
   operationId?: string;
+  /** True when the provider executed the tool inside the model request. */
+  providerExecuted?: boolean;
+  /** Raw provider result retained for provider-native replay; never rendered directly. */
+  providerOutput?: unknown;
   isError: boolean;
   content: ToolResultContent;
   durationMs?: number;
@@ -834,6 +842,13 @@ export interface SandboxBoundaryRequestEvent extends BaseEvent {
   justification: string;
   expansion: SandboxBoundaryExpansion;
 }
+
+/**
+ * The requests a session can park on while it waits for the user. Both are
+ * registered by RuntimeKernel while unanswered, so a surface that missed the
+ * live event can rehydrate the prompt instead of stranding the run.
+ */
+export type ActiveInteractionRequestEvent = SandboxBoundaryRequestEvent | UserQuestionRequestEvent;
 
 export interface SandboxBoundaryDecisionAckEvent extends BaseEvent {
   type: 'sandbox_boundary_decision_ack';

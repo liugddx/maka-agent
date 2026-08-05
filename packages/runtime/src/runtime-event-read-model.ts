@@ -73,6 +73,13 @@ export function isHardRuntimeEventReadModelDiagnostic(diagnostic: {
   return RUNTIME_EVENT_READ_MODEL_DIAGNOSTIC_SEVERITY[diagnostic.code] === 'hard';
 }
 
+export function isContinuationStartRuntimeEvent(event: RuntimeEvent): boolean {
+  return (
+    event.actions?.stateDelta?.continuationStart === true ||
+    event.actions?.continuationStart !== undefined
+  );
+}
+
 /**
  * Codes that mean the projection did not claim an event, at either severity.
  *
@@ -299,10 +306,7 @@ export function projectRuntimeEventsToStoredMessages(
       projected = true;
     }
 
-    if (
-      event.actions?.stateDelta?.continuationStart === true ||
-      event.actions?.continuationStart !== undefined
-    ) {
+    if (isContinuationStartRuntimeEvent(event)) {
       // Continuation start is a canonical lineage/recovery fact with no
       // legacy chat row. Its following model events own the visible output.
       projected = true;
@@ -623,6 +627,9 @@ function projectText(
       turnId: event.turnId,
       ts: event.ts,
       text: event.content.text,
+      ...(event.content.providerOptions !== undefined
+        ? { providerOptions: structuredClone(event.content.providerOptions) }
+        : {}),
       ...(contentOrder ? { contentOrder } : {}),
       modelId: header.modelId,
     });
@@ -760,6 +767,12 @@ function projectFunctionCall(
     // the UI timeline falls back to legacy tools-before-text ordering.
     ...(event.refs?.stepId ? { stepId: event.refs.stepId } : {}),
     args: event.content.args,
+    ...(event.content.providerOptions !== undefined
+      ? { providerOptions: structuredClone(event.content.providerOptions) }
+      : {}),
+    ...(event.content.providerExecuted !== undefined
+      ? { providerExecuted: event.content.providerExecuted }
+      : {}),
   });
   return true;
 }
@@ -855,6 +868,12 @@ function projectFunctionResponse(
     toolUseId,
     isError: event.content.isError === true,
     content: resultContent,
+    ...(event.content.providerExecuted !== undefined
+      ? { providerExecuted: event.content.providerExecuted }
+      : {}),
+    ...(event.content.providerExecuted && event.content.providerOutput !== undefined
+      ? { providerOutput: structuredClone(event.content.providerOutput) }
+      : {}),
     ...(numberStateDelta(event, 'durationMs') !== undefined
       ? { durationMs: numberStateDelta(event, 'durationMs') }
       : {}),

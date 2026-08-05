@@ -355,6 +355,20 @@ describe('SQLite workflow stores', () => {
     });
   });
 
+  test('purges Deep Research events for retired Sessions', async () => {
+    await withRoot(async (root) => {
+      const store = createSqliteDeepResearchStore(root);
+      try {
+        await store.start(SESSION_ID, 'Remove the retired research workspace', 'standard');
+        await store.purgeSessionState(SESSION_ID);
+        assert.equal(await store.read(SESSION_ID), undefined);
+        assert.deepEqual(await store.readEvents(SESSION_ID), []);
+      } finally {
+        store.close();
+      }
+    });
+  });
+
   test('persists Plan Reminders', async () => {
     await withRoot(async (root) => {
       const store = createSqlitePlanReminderStore(root);
@@ -366,6 +380,32 @@ describe('SQLite workflow stores', () => {
         assert.equal((await reopened.list())[0]?.id, reminder.id);
       } finally {
         reopened.close();
+      }
+    });
+  });
+
+  test('stamps Plan Reminders with an explicit creation clock', async () => {
+    await withRoot(async (root) => {
+      const store = createSqlitePlanReminderStore(root);
+      try {
+        const createdAt = Date.now() - 5 * 60_000;
+        const reminder = await store.create(
+          { title: 'Seeded at a fixed clock', runAt: Date.now() + 60_000 },
+          createdAt,
+        );
+        assert.equal(reminder.createdAt, createdAt);
+        assert.equal(reminder.updatedAt, createdAt);
+        // The injected clock also governs validation, so a runAt still ahead
+        // of wall time but behind that clock is rejected.
+        await assert.rejects(
+          store.create(
+            { title: 'Behind the injected clock', runAt: Date.now() + 60_000 },
+            Date.now() + 2 * 60_000,
+          ),
+          /must be in the future/,
+        );
+      } finally {
+        store.close();
       }
     });
   });

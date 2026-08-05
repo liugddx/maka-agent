@@ -22,6 +22,7 @@ import {
   serializeOAuthSubscriptionTokens,
   type OAuthSubscriptionTokens,
   type BackendFactoryContext,
+  type AiSdkBackendInput,
   type FilesystemWorkerExecuteInput,
   type MakaTool,
   type MakaToolContext,
@@ -51,6 +52,7 @@ import type { TurnSnapshot, UsageQueryResult } from '../protocol/index.js';
 import type { ClientCapabilityHostFrame } from '../protocol/index.js';
 import { createExecutionRuntimeHostComposition } from '../server/execution-composition.js';
 import {
+  createHostDailyReviewModel,
   createHostGoalEvaluator,
   createHostSessionEffectModel,
 } from '../server/execution-model-authority.js';
@@ -274,6 +276,56 @@ test('backend creation does not acquire Client Capabilities beyond a bound tool 
   );
   try {
     assert.equal(snapshotCalls, 0);
+  } finally {
+    await backend.dispose();
+  }
+});
+
+test('backend creation routes a bound WebSearch tool without widening the child ceiling', async () => {
+  const clientSearch: MakaTool = {
+    name: 'WebSearch',
+    description: 'Client web search',
+    parameters: {},
+    impl: async () => undefined,
+  };
+  const ready = {
+    kind: 'ready' as const,
+    connection: {
+      slug: 'deepseek-responses',
+      providerType: 'deepseek' as const,
+      enabledModelIds: ['deepseek-v4-flash'],
+      models: [{ id: 'deepseek-v4-flash', apiProtocol: 'openai-responses' as const }],
+    },
+    networkProxy: { enabled: false },
+    secretMaterial: { connection: { secret: API_KEY } },
+  };
+  const policy = {
+    ...createDefaultRuntimePolicy(),
+    webSearch: { enabled: true, defaultProvider: 'model' as const },
+  };
+  const runtimePolicy = {
+    operations: { resolveExecutionConnection: async () => ready },
+    runtimePolicy: {
+      getSnapshot: async () => ({ revision: 1, policy }),
+    },
+  } as unknown as RuntimePolicyStoresWriter;
+  const backend = await createHostAiSdkBackend(
+    backendCreationFixture({
+      abortSignal: new AbortController().signal,
+      resolveExecutionConnection: async () => ready,
+      readPricing: async () => ({ revision: 0, overrides: [] }),
+      runtimePolicy,
+      tools: [clientSearch],
+      modelId: 'deepseek-v4-flash',
+    }),
+  );
+  try {
+    const input = (backend as unknown as { input: AiSdkBackendInput }).input;
+    assert.deepEqual(
+      input.tools.map((tool) => tool.name),
+      ['WebSearch'],
+    );
+    assert.equal(input.tools[0]?.providerTool?.kind, 'openai-web-search');
   } finally {
     await backend.dispose();
   }
@@ -592,6 +644,15 @@ test('production Host executes a canonical ai-sdk Session against a real provide
       },
     });
     assert.equal(memoryEnabled.kind, 'committed');
+    policySnapshot = await policy.runtimePolicy.getSnapshot();
+    const webSearchEnabled = await policy.runtimePolicy.mutate({
+      expectedRevision: policySnapshot.revision,
+      operation: {
+        kind: 'set_web_search',
+        value: { enabled: true, defaultProvider: 'tavily' },
+      },
+    });
+    assert.equal(webSearchEnabled.kind, 'committed');
 
     const execution = await openInteractiveExecutionStoresForWrite(owner.lease);
     const session = await execution.sessionStore.create({
@@ -1060,6 +1121,15 @@ test('production Host executes a durable runnable child with an exact tool ceili
       'committed',
     );
     await publishConnectionModel(policy, connection.connectionId, MODEL_ID, 32_768);
+    const policySnapshot = await policy.runtimePolicy.getSnapshot();
+    const webSearchEnabled = await policy.runtimePolicy.mutate({
+      expectedRevision: policySnapshot.revision,
+      operation: {
+        kind: 'set_web_search',
+        value: { enabled: true, defaultProvider: 'tavily' },
+      },
+    });
+    assert.equal(webSearchEnabled.kind, 'committed');
 
     const execution = await openInteractiveExecutionStoresForWrite(owner.lease);
     const parent = await execution.sessionStore.create({
@@ -1168,7 +1238,7 @@ test('production Host executes a durable runnable child with an exact tool ceili
       provider: 'tavily',
       query: 'latest hosted web result',
       reason: 'not_configured',
-      message: 'Enable web search before using this tool.',
+      message: 'Configure a Tavily API key before using web search.',
     });
     const artifacts = await openInteractiveArtifactStoreForWrite(owner.lease);
     const childArtifacts = await artifacts.listTurnArtifacts(child.id, childRuns[0]!.turnId);
@@ -1325,7 +1395,6 @@ test('production Host publishes and retires an implementation child patch', asyn
     assert.ok(toolNames(requests[1]?.body).includes('agent_spawn'));
     assert.deepEqual(toolParameterEnum(requests[1]?.body, 'agent_spawn', 'profile'), [
       'local_read',
-      'web_research',
       'implementation',
     ]);
     assert.deepEqual(toolNames(requests[2]?.body), [
@@ -1461,8 +1530,8 @@ test('production Host publishes and retires an implementation child patch', asyn
   }
 });
 
-test('Host Goal evaluator meters provider usage and aborts its physical request', {
-  timeout: 10_000,
+test('Host auxiliary models meter provider usage and abort physical requests', {
+  timeout: 20_000,
 }, async () => {
   const base = await mkdtemp(join(tmpdir(), 'maka-host-goal-evaluator-'));
   const provider = await startProvider();
@@ -1582,6 +1651,32 @@ test('Host Goal evaluator meters provider usage and aborts its physical request'
           row.callId === `session_recap_${session.id}_recap-effect-1`,
       ),
     );
+
+    const dailyReview = createHostDailyReviewModel({
+      runtimePolicy: policy,
+      oauthCredentials: new HostOAuthExecutionAuthority(policy),
+      claudeDeviceId: capability.rootId,
+      usage,
+      requestDrain: () => assert.fail('Daily Review telemetry must not drain the Host'),
+      newId: () => 'daily-review-call-1',
+    });
+    assert.deepEqual(
+      await dailyReview.generate({
+        modelKey: `goal-evaluator-provider::${MODEL_ID}`,
+        prompt: 'Generate one Daily Review.',
+        abortSignal: new AbortController().signal,
+      }),
+      {
+        ok: true,
+        text: SUMMARY_TEXT,
+        modelKey: `goal-evaluator-provider::${MODEL_ID}`,
+      },
+    );
+    const dailyReviewLogs = await usage.telemetry.logs({ range: 'all' });
+    const dailyReviewLog = dailyReviewLogs.rows.find((row) => row.callKind === 'daily_review');
+    assert.ok(dailyReviewLog);
+    assert.equal(dailyReviewLog.callId, 'daily_review_daily-review-call-1');
+    assert.equal(dailyReviewLog.sessionId, undefined);
 
     assert.deepEqual(
       await sessionEffects.generateRecap({
@@ -1760,14 +1855,21 @@ test('Host Goal evaluator meters provider usage and aborts its physical request'
         },
       }),
     });
+    // An explicit controller instead of AbortSignal.timeout(10): a wall-clock
+    // timer races the preflight under load, and an abort that lands before
+    // dispatch takes a different error path (#2132). Aborting after the
+    // dispatch barrier settles pins the abort mid-flight; the TimeoutError
+    // reason name keeps the errorClass classification.
+    const effectTimeout = new AbortController();
     const timedEffect = stalledEffect.generateRecap({
       sessionId: session.id,
       effectId: 'recap-timeout',
       header: session,
       events: [],
-      abortSignal: AbortSignal.timeout(10),
+      abortSignal: effectTimeout.signal,
     });
     await settleWithin(effectProviderDispatched.promise);
+    effectTimeout.abort(new DOMException('provider stalled', 'TimeoutError'));
     const timedResult = await settleWithin(timedEffect);
     assert.equal(timedResult.ok, false);
     if (timedResult.ok) return;
@@ -1966,6 +2068,76 @@ test('Client Capability tools join the existing load_tools catalog without a par
       toolNames: [capabilityTool.name],
     },
   );
+});
+
+test('Deep Research composition keeps one read-only research surface and prompt', async () => {
+  const tool = (name: string, categoryHint?: MakaTool['categoryHint']): MakaTool => ({
+    name,
+    description: `${name} fixture`,
+    parameters: {},
+    ...(categoryHint ? { categoryHint } : {}),
+    impl: async () => name,
+  });
+  const read = tool('Read');
+  const webSearch = tool('WebSearch');
+  const shell = tool('Shell');
+  const deepResearchStatus = tool('deep_research_status');
+  const unsafeDeepResearchTool = tool('deep_research_unsafe_fixture');
+  const clientMutation = tool('mcp__opaque__mutate', 'client_capability');
+  const composition = createHostExecutionModelComposition({
+    policy: {
+      getSnapshot: async () => ({ revision: 0, policy: createDefaultRuntimePolicy() }),
+    },
+    skills: {
+      readCanonicalModelInventory: async () => ({ inventory: [] }),
+    } as unknown as HostSkillCatalogCoordinator,
+    memory: {
+      readPromptProjection: async () => ({
+        policy: { revision: 0, policy: createDefaultRuntimePolicy() },
+      }),
+    } as unknown as HostMemoryCoordinator,
+    taskLedger: { list: async () => [] } as unknown as TaskLedgerStore,
+    hostTools: [read, webSearch, shell, unsafeDeepResearchTool],
+    parentAgentTools: buildParentAgentTools(),
+    clientCapabilities: {
+      tools: [clientMutation],
+      groups: [
+        {
+          id: 'client_fixture',
+          label: 'Opaque fixture',
+          toolNames: [clientMutation.name],
+        },
+      ],
+    },
+    deepResearch: { tools: [deepResearchStatus] },
+  });
+
+  assert.deepEqual(composition.tools.map((candidate) => candidate.name).sort(), [
+    'AskUserQuestion',
+    'Read',
+    'WebSearch',
+    'deep_research_status',
+  ]);
+  assert.equal(composition.tools.includes(shell), false);
+  assert.equal(composition.tools.includes(clientMutation), false);
+  assert.equal(composition.tools.includes(unsafeDeepResearchTool), false);
+  assert.equal(
+    composition.tools.some((candidate) => candidate.categoryHint === 'subagent'),
+    false,
+  );
+  assert.equal(
+    composition.toolAvailability.groups?.find((group) => group.id === 'client_fixture'),
+    undefined,
+  );
+  const prompt =
+    (await composition.systemPrompt({
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      cwd: process.cwd(),
+      workspaceRoot: process.cwd(),
+    })) ?? '';
+  assert.match(prompt, /Deep research mode is active/);
+  assert.doesNotMatch(prompt, /ExploreAgent/);
 });
 
 test('Plan composition admits only planning tools before approval and execution controls after', async () => {
@@ -2339,6 +2511,7 @@ function backendCreationFixture(input: {
   oauthCredentials?: HostOAuthExecutionAuthority;
   claudeDeviceId?: string;
   tools?: readonly MakaTool[];
+  modelId?: string;
   snapshotClientCapabilities?: () => unknown;
   executionBoundary?: unknown;
   loadTurnRuntimeEvents?: () => Promise<RuntimeEvent[]>;
@@ -2352,7 +2525,7 @@ function backendCreationFixture(input: {
       workspaceRoot: '/workspace',
       header: {
         llmConnectionSlug: 'backend-creation-connection',
-        model: MODEL_ID,
+        model: input.modelId ?? MODEL_ID,
         cwd: '/workspace',
         permissionMode: 'bypass',
       },

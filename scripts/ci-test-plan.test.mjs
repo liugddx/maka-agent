@@ -86,6 +86,28 @@ test('stress and specialized script checks run only for their owning surfaces', 
   assert.deepEqual(measurement.workspaces, []);
 });
 
+test('release tooling and the release config select the checks that cover them', () => {
+  const graph = loadWorkspaceGraph();
+  // These run only on release day, so CI has to select their tests from the
+  // change itself; verify-packaged-app.mjs is shared, and a change there reaches
+  // the macOS release path without touching anything macOS-specific.
+  for (const path of [
+    'scripts/npm-spawn.mjs',
+    'scripts/package-windows-x64.mjs',
+    'scripts/verify-windows-x64.mjs',
+    'scripts/windows-x64-release.test.mjs',
+    'scripts/verify-packaged-app.mjs',
+    'scripts/verify-macos-arm64-dmg.mjs',
+  ]) {
+    assert.equal(planTests([path], { graph }).scriptMode, 'extended', path);
+  }
+  // electron-builder rejects an unknown option outright, and only
+  // scripts/electron-builder-config.test.mjs would notice before release day.
+  const releaseConfig = planTests(['apps/desktop/electron-builder.config.mjs'], { graph });
+  assert.equal(releaseConfig.scriptMode, 'fast');
+  assert.ok(releaseConfig.workspaces.includes('apps/desktop'));
+});
+
 test('sandbox is flagged whenever the cli workspace runs in the closure', () => {
   // packages/cli/src/__tests__/runtime-bootstrap.test.ts executes real sandboxed
   // shell tools, so any change whose dependency closure selects packages/cli must
@@ -104,7 +126,7 @@ test('heavy workspaces are projected onto dedicated CI lanes', () => {
   const runtimeHost = planTests(['packages/runtime-host/src/server/index.ts'], { graph });
   assert.equal(runtimeHost.runtimeHost, true);
   assert.equal(runtimeHost.headless, false);
-  assert.deepEqual(runtimeHost.standardWorkspaces, ['packages/cli']);
+  assert.deepEqual(runtimeHost.standardWorkspaces, ['packages/cli', 'apps/desktop']);
 
   const runtime = planTests(['packages/runtime/src/index.ts'], { graph });
   assert.equal(runtime.runtimeHost, true);
@@ -127,7 +149,7 @@ test('heavy workspaces are projected onto dedicated CI lanes', () => {
   const outputs = formatGitHubOutputs(runtimeHost).split('\n');
   assert.ok(outputs.includes('runtime_host=true'));
   assert.ok(outputs.includes('headless=false'));
-  assert.ok(outputs.includes('standard_workspaces=packages/cli'));
+  assert.ok(outputs.includes('standard_workspaces=packages/cli,apps/desktop'));
 });
 
 test('global and unknown production changes fail safe to the complete suite', () => {

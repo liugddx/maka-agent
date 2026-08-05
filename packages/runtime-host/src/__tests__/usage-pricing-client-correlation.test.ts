@@ -14,6 +14,7 @@ import { prepareRuntimeHostEndpoint } from '../control/endpoint.js';
 import { removeHostRegistration, writeHostRegistration } from '../control/registration.js';
 import {
   decodeClientFrame,
+  RUNTIME_HOST_COMPATIBILITY_EPOCH,
   RUNTIME_HOST_PROTOCOL_VERSION,
   RUNTIME_HOST_REGISTRATION_SCHEMA_VERSION,
   RuntimeHostProtocolError,
@@ -92,7 +93,7 @@ const mismatchCases = [
       kind: 'page',
       revision: 8,
       offset: 50,
-      overrides: [],
+      entries: [],
       nextOffset: null,
     },
   },
@@ -280,6 +281,7 @@ async function withProtocolPeer(
       endpoint: endpoint.path,
       protocolMin: RUNTIME_HOST_PROTOCOL_VERSION,
       protocolMax: RUNTIME_HOST_PROTOCOL_VERSION,
+      compatibilityEpoch: RUNTIME_HOST_COMPATIBILITY_EPOCH,
       state: 'ready',
       pid: process.pid,
       createdAt: new Date().toISOString(),
@@ -316,6 +318,7 @@ async function acceptConnectionAndReadRequest(
     hostEpoch,
     connectionId: 'usage-pricing-correlation',
     selectedProtocol: RUNTIME_HOST_PROTOCOL_VERSION,
+    compatibilityEpoch: RUNTIME_HOST_COMPATIBILITY_EPOCH,
     state: 'ready',
   });
   const request = decodeClientFrame(await transport.read(REQUEST_TIMEOUT_MS));

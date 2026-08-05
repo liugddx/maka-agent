@@ -26,7 +26,12 @@ import {
   type TaskRunOutput,
   type TaskRunner,
 } from './fixed-prompt-controller.js';
-import type { HarborVerifierAttempt, HarborVerifierOutcome } from './fixed-prompt-wal-types.js';
+import { buildAgentRepoMounts } from './agent-repo-mount.js';
+import type {
+  HarborTrialGrade,
+  HarborVerifierAttempt,
+  HarborVerifierOutcome,
+} from './fixed-prompt-wal-types.js';
 import {
   HARBOR_ORACLE_EXECUTION_POLICY,
   HARBOR_ORACLE_MAX_ATTEMPTS,
@@ -75,6 +80,11 @@ import {
   CLAUDE_CODE_TOOLCHAIN_FINGERPRINT,
   CLAUDE_CODE_TOOLCHAIN_SPEC,
 } from './claude-code-toolchain.js';
+import {
+  REASONIX_TOOLCHAIN_CONTAINER_PATH,
+  REASONIX_TOOLCHAIN_FINGERPRINT,
+  REASONIX_TOOLCHAIN_SPEC,
+} from './reasonix-toolchain.js';
 
 import { agentPhaseTimeoutSec, settlementGraceSec } from './maka-settlement.js';
 
@@ -82,7 +92,73 @@ export { MAKA_SETTLEMENT_GRACE_SEC } from './maka-settlement.js';
 
 const execFileAsync = promisify(execFile);
 
-const CONTAINER_MAKA_REPO = '/opt/maka-agent';
+/**
+ * Every competitor arm is pinned the same way: a prepared toolchain directory
+ * bind-mounted read-only, a version that must match the pinned spec, and a
+ * fingerprint the in-container adapter re-verifies before it runs. Only Maka
+ * runs from the repo mount, so it has no entry.
+ */
+const COMPETITOR_TOOLCHAINS: Readonly<
+  Record<
+    Exclude<HarnessAgentId, 'maka'>,
+    {
+      readonly label: string;
+      readonly optionKey: keyof Pick<
+        HarborTaskRunnerOptions,
+        | 'opencodeToolchainPath'
+        | 'kimiCodeToolchainPath'
+        | 'codexToolchainPath'
+        | 'claudeCodeToolchainPath'
+        | 'reasonixToolchainPath'
+      >;
+      readonly version: string;
+      readonly containerPath: string;
+      readonly fingerprint: string;
+      readonly fingerprintEnvKey: string;
+    }
+  >
+> = {
+  opencode: {
+    label: 'OpenCode',
+    optionKey: 'opencodeToolchainPath',
+    version: OPENCODE_TOOLCHAIN_SPEC.opencode.version,
+    containerPath: OPENCODE_TOOLCHAIN_CONTAINER_PATH,
+    fingerprint: OPENCODE_TOOLCHAIN_FINGERPRINT,
+    fingerprintEnvKey: 'MAKA_OPENCODE_TOOLCHAIN_FINGERPRINT',
+  },
+  'kimi-code': {
+    label: 'Kimi Code',
+    optionKey: 'kimiCodeToolchainPath',
+    version: KIMI_CODE_TOOLCHAIN_SPEC.kimiCode.version,
+    containerPath: KIMI_CODE_TOOLCHAIN_CONTAINER_PATH,
+    fingerprint: KIMI_CODE_TOOLCHAIN_FINGERPRINT,
+    fingerprintEnvKey: 'MAKA_KIMI_CODE_TOOLCHAIN_FINGERPRINT',
+  },
+  codex: {
+    label: 'Codex',
+    optionKey: 'codexToolchainPath',
+    version: CODEX_TOOLCHAIN_SPEC.codex.version,
+    containerPath: CODEX_TOOLCHAIN_CONTAINER_PATH,
+    fingerprint: CODEX_TOOLCHAIN_FINGERPRINT,
+    fingerprintEnvKey: 'MAKA_CODEX_TOOLCHAIN_FINGERPRINT',
+  },
+  'claude-code': {
+    label: 'Claude Code',
+    optionKey: 'claudeCodeToolchainPath',
+    version: CLAUDE_CODE_TOOLCHAIN_SPEC.claudeCode.version,
+    containerPath: CLAUDE_CODE_TOOLCHAIN_CONTAINER_PATH,
+    fingerprint: CLAUDE_CODE_TOOLCHAIN_FINGERPRINT,
+    fingerprintEnvKey: 'MAKA_CLAUDE_CODE_TOOLCHAIN_FINGERPRINT',
+  },
+  reasonix: {
+    label: 'Reasonix',
+    optionKey: 'reasonixToolchainPath',
+    version: REASONIX_TOOLCHAIN_SPEC.reasonix.version,
+    containerPath: REASONIX_TOOLCHAIN_CONTAINER_PATH,
+    fingerprint: REASONIX_TOOLCHAIN_FINGERPRINT,
+    fingerprintEnvKey: 'MAKA_REASONIX_TOOLCHAIN_FINGERPRINT',
+  },
+};
 const TRIAL_CELL_OUTPUT = 'agent/maka-cell-output.json';
 const TRIAL_EXECUTION_IDENTITY = 'agent/maka-cell-execution-identity.json';
 const TRIAL_USAGE_CHECKPOINT = 'agent/maka-cell-usage-checkpoint.json';
@@ -119,6 +195,20 @@ export function incompleteTerminalProviderRequest(
   if (!terminal || terminal.outcome === 'completed') return undefined;
   if (agentPhaseSettled && terminal.outcome === 'aborted') return undefined;
   return terminal;
+}
+
+/** Shared across runners: a verdict is this arm's evidence only if the agent got
+ * the run it was given. A tail request the upstream cut short says it did not,
+ * so the grade does not travel — the same boundary that makes a settled trial
+ * infra, applied where the trial ends as a budget exhaustion instead. Without
+ * it, a provider outage that a verifier happened to pass would be recorded as a
+ * pass on the one path that skips the infra check. `aborted` stays exempt: the
+ * agent phase ended, and tearing the request down is what that looks like. */
+export function trialGradeSurvivingProviderOutage<T>(
+  grade: T | undefined,
+  providerTelemetry: readonly ProviderRequestTelemetry[],
+): T | undefined {
+  return incompleteTerminalProviderRequest(providerTelemetry, true) ? undefined : grade;
 }
 
 export class HarborInfraError extends Error {
@@ -177,6 +267,8 @@ export interface HarborTaskRunnerOptions {
   codexToolchainPath?: string;
   /** Prepared Claude Code native toolchain mounted read-only into task containers. */
   claudeCodeToolchainPath?: string;
+  /** Prepared Reasonix toolchain mounted read-only into task containers. */
+  reasonixToolchainPath?: string;
   /** Explicit Docker target platform shared by comparison arms. */
   dockerPlatform?: 'linux/amd64';
   /** Base directory under which each task gets an isolated per-task job dir. */
@@ -406,15 +498,22 @@ export function createHarborTaskRunner(options: HarborTaskRunnerOptions): TaskRu
               runnerOptions.agent,
               harborTraceMode(runnerOptions.agentEnv),
             );
+            // The exhaustion is the agent's fact; the verifier's verdict is the
+            // harness's. Both are true at once, so both travel — dropping the
+            // verdict because the agent never filed its self-report threw away a
+            // pass Harbor had already awarded.
+            const harbor = trialGradeSurvivingProviderOutage(
+              trialVerifierArtifacts(rewardArtifact, verifierArtifact, input.task.id),
+              providerTelemetry,
+            );
             throw new FixedPromptBudgetExhaustedError(
               `agent budget exhausted for task ${input.task.id}`,
               formatTrialException(trialException),
-              artifactRefs || providerTelemetry.length > 0
-                ? {
-                    ...(artifactRefs ?? {}),
-                    ...(providerTelemetry.length > 0 ? { providerTelemetryPath } : {}),
-                  }
-                : undefined,
+              {
+                ...(artifactRefs ?? {}),
+                ...(harbor ? { harbor } : {}),
+                ...(providerTelemetry.length > 0 ? { providerTelemetryPath } : {}),
+              },
             );
           }
           completeTimedOutTrial = true;
@@ -423,6 +522,13 @@ export function createHarborTaskRunner(options: HarborTaskRunnerOptions): TaskRu
           // workspace it left: a real result. Keep the cell's own status and
           // errorClass — nothing here is a deadline, so nothing may claim one —
           // and let the structured verifier grade score it.
+          //
+          // The cell requirement is a known exclusion, not the veto fixed above:
+          // a graded agent-exit trial with no self-report has no truthful event
+          // to land in. It claims no deadline, so task_budget_exhausted would
+          // lie, and task_completed needs the runtimeRefs/steps only the cell
+          // attests. Until such a shape exists it stays infra. Widening it is a
+          // WAL taxonomy decision, tracked separately.
           verifierSettledTrial =
             rewardArtifact !== null &&
             cellArtifact !== null &&
@@ -438,9 +544,13 @@ export function createHarborTaskRunner(options: HarborTaskRunnerOptions): TaskRu
           tail(result.stderr || result.stdout),
         );
       }
+      // A trial that raised nothing ended its agent phase on its own terms, so it
+      // settles the tail request the same way the two abnormal shapes above do.
+      // Leaving it out read every clean exit that closed a stream mid-flight as
+      // an outage and threw the graded cell away.
       const terminalProviderRequest = incompleteTerminalProviderRequest(
         providerTelemetry,
-        completeTimedOutTrial || verifierSettledTrial,
+        termination === null || completeTimedOutTrial || verifierSettledTrial,
       );
       if (terminalProviderRequest) {
         throw new HarborInfraError(
@@ -867,6 +977,10 @@ async function readVerifierOutcome(
       errorText(error),
     );
   }
+  return parseVerifierOutcome(value, taskId);
+}
+
+function parseVerifierOutcome(value: unknown, taskId: string): HarborVerifierOutcome {
   if (!isRecord(value) || value.schemaVersion !== 1) {
     throw new HarborInfraError(`verifier outcome is malformed for task ${taskId}`);
   }
@@ -1010,83 +1124,30 @@ export function buildHarborJobConfig(
   const makaModel = modelIdForProvider(options.model, provider);
   const adapter = options.agent ?? 'maka';
   const agentModel = adapter === 'opencode' ? modelForOpenCode(options.model, provider) : makaModel;
-  if (adapter === 'opencode' && !options.opencodeToolchainPath) {
-    throw new Error('opencodeToolchainPath is required for the OpenCode adapter');
-  }
-  if (adapter === 'opencode' && options.agentVersion !== OPENCODE_TOOLCHAIN_SPEC.opencode.version) {
-    throw new Error(
-      `OpenCode adapter version must match toolchain version ${OPENCODE_TOOLCHAIN_SPEC.opencode.version}`,
-    );
-  }
-  if (adapter === 'kimi-code' && !options.kimiCodeToolchainPath) {
-    throw new Error('kimiCodeToolchainPath is required for the Kimi Code adapter');
-  }
-  if (
-    adapter === 'kimi-code' &&
-    options.agentVersion !== KIMI_CODE_TOOLCHAIN_SPEC.kimiCode.version
-  ) {
-    throw new Error(
-      `Kimi Code adapter version must match toolchain version ${KIMI_CODE_TOOLCHAIN_SPEC.kimiCode.version}`,
-    );
-  }
-  if (adapter === 'codex' && !options.codexToolchainPath) {
-    throw new Error('codexToolchainPath is required for the Codex adapter');
-  }
-  if (adapter === 'codex' && options.agentVersion !== CODEX_TOOLCHAIN_SPEC.codex.version) {
-    throw new Error(
-      `Codex adapter version must match toolchain version ${CODEX_TOOLCHAIN_SPEC.codex.version}`,
-    );
-  }
-  if (adapter === 'claude-code' && !options.claudeCodeToolchainPath) {
-    throw new Error('claudeCodeToolchainPath is required for the Claude Code adapter');
-  }
-  if (
-    adapter === 'claude-code' &&
-    options.agentVersion !== CLAUDE_CODE_TOOLCHAIN_SPEC.claudeCode.version
-  ) {
-    throw new Error(
-      `Claude Code adapter version must match toolchain version ${CLAUDE_CODE_TOOLCHAIN_SPEC.claudeCode.version}`,
-    );
+  const toolchain = adapter === 'maka' ? undefined : COMPETITOR_TOOLCHAINS[adapter];
+  if (toolchain) {
+    const toolchainPath = options[toolchain.optionKey];
+    if (!toolchainPath) {
+      throw new Error(`${toolchain.optionKey} is required for the ${toolchain.label} adapter`);
+    }
+    if (options.agentVersion !== toolchain.version) {
+      throw new Error(
+        `${toolchain.label} adapter version must match toolchain version ${toolchain.version}`,
+      );
+    }
   }
   const mounts: Array<Record<string, unknown>> = [
-    { type: 'bind', source: options.makaRepoPath, target: CONTAINER_MAKA_REPO, read_only: true },
-    ...(adapter === 'opencode'
+    ...buildAgentRepoMounts(adapter, options.makaRepoPath),
+    ...(toolchain
       ? [
           {
             type: 'bind',
-            source: options.opencodeToolchainPath!,
-            target: OPENCODE_TOOLCHAIN_CONTAINER_PATH,
+            source: options[toolchain.optionKey]!,
+            target: toolchain.containerPath,
             read_only: true,
           },
         ]
-      : adapter === 'kimi-code'
-        ? [
-            {
-              type: 'bind',
-              source: options.kimiCodeToolchainPath!,
-              target: KIMI_CODE_TOOLCHAIN_CONTAINER_PATH,
-              read_only: true,
-            },
-          ]
-        : adapter === 'codex'
-          ? [
-              {
-                type: 'bind',
-                source: options.codexToolchainPath!,
-                target: CODEX_TOOLCHAIN_CONTAINER_PATH,
-                read_only: true,
-              },
-            ]
-          : adapter === 'claude-code'
-            ? [
-                {
-                  type: 'bind',
-                  source: options.claudeCodeToolchainPath!,
-                  target: CLAUDE_CODE_TOOLCHAIN_CONTAINER_PATH,
-                  read_only: true,
-                },
-              ]
-            : []),
+      : []),
   ];
 
   const agentEnv: Record<string, string> = {
@@ -1102,17 +1163,8 @@ export function buildHarborJobConfig(
     agentEnv.MAKA_REASONING_EFFORT = options.reasoningEffort;
     if (adapter === 'opencode') agentEnv.MAKA_OPENCODE_VARIANT = options.reasoningEffort;
   }
-  if (adapter === 'opencode') {
-    agentEnv.MAKA_OPENCODE_TOOLCHAIN_FINGERPRINT = OPENCODE_TOOLCHAIN_FINGERPRINT;
-  }
-  if (adapter === 'kimi-code') {
-    agentEnv.MAKA_KIMI_CODE_TOOLCHAIN_FINGERPRINT = KIMI_CODE_TOOLCHAIN_FINGERPRINT;
-  }
-  if (adapter === 'codex') {
-    agentEnv.MAKA_CODEX_TOOLCHAIN_FINGERPRINT = CODEX_TOOLCHAIN_FINGERPRINT;
-  }
-  if (adapter === 'claude-code') {
-    agentEnv.MAKA_CLAUDE_CODE_TOOLCHAIN_FINGERPRINT = CLAUDE_CODE_TOOLCHAIN_FINGERPRINT;
+  if (toolchain) {
+    agentEnv[toolchain.fingerprintEnvKey] = toolchain.fingerprint;
   }
 
   if (options.pricing) {
@@ -1200,7 +1252,13 @@ export function buildHarborJobConfig(
                 }
               : {},
         env: agentEnv,
-        ...(agentPhaseSec !== undefined ? { max_timeout_sec: agentPhaseSec } : {}),
+        // override_timeout_sec, not max_timeout_sec: Harbor resolves the agent
+        // phase as `min(override ?? task_declared, max ?? inf)`, so max_ can only
+        // ever lower the task's own timeout. Asking for budget + settlement
+        // through max_ resolved to the task timeout unchanged, which left Maka's
+        // settlement window mathematically unreachable — the cell was SIGKILLed
+        // at the instant it was supposed to start writing.
+        ...(agentPhaseSec !== undefined ? { override_timeout_sec: agentPhaseSec } : {}),
       },
     ],
     datasets: [],
@@ -1648,6 +1706,29 @@ export function classifyTrialTermination(
     return 'agent_budget';
   if (exception.type === 'NonZeroAgentExitCodeError') return 'agent_exit';
   return 'external';
+}
+
+/** What the verifier wrote about the trial, read straight from its own
+ * artifacts. It exists independently of `maka-cell-output.json`: that file is
+ * the agent's self-report, and an agent that ran out of budget mid-write never
+ * gets to file one, so a budget exhaustion can still carry the verdict Harbor
+ * reached. This only transports what is on disk — whether the two artifacts
+ * agree, and so whether they amount to a grade, is decided once by the
+ * controller's structuredVerifierGrade, the same judge the completed path uses.
+ * Artifacts that do not parse are not evidence and travel as nothing. */
+function trialVerifierArtifacts(
+  rewardArtifact: string | null,
+  verifierArtifact: string | null,
+  taskId: string,
+): HarborTrialGrade | undefined {
+  if (rewardArtifact === null || verifierArtifact === null) return undefined;
+  const reward = Number(rewardArtifact.trim());
+  if (rewardArtifact.trim().length === 0 || !Number.isFinite(reward)) return undefined;
+  try {
+    return { reward, verifier: parseVerifierOutcome(JSON.parse(verifierArtifact), taskId) };
+  } catch {
+    return undefined;
+  }
 }
 
 /** A verifier outcome is authoritative evidence that the trial was graded only

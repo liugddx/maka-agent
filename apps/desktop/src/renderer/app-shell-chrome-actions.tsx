@@ -1,9 +1,4 @@
 import {
-  CircleGauge,
-  Grid3X3,
-  HelpCircle,
-  MessageCircleQuestion,
-  MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
@@ -14,17 +9,8 @@ import {
   IconButton,
   useUiLocale,
 } from '@maka/ui';
-import {
-  DropdownMenu,
-  DropdownMenuItem,
-} from '@astryxdesign/core/DropdownMenu';
 import { Icon } from '@astryxdesign/core/Icon';
 import { Tooltip } from '@astryxdesign/core/Tooltip';
-import {
-  SideNavCollapseButton,
-  type SideNavImperativeCollapseHandle,
-} from '@astryxdesign/core/SideNav';
-import { useRef, useState, type RefObject } from 'react';
 import { getShellCopy } from './locales/shell-copy';
 
 /**
@@ -36,9 +22,48 @@ function ChromeIcon(props: { icon: typeof Search }) {
   return <Icon icon={props.icon} size="sm" color="secondary" />;
 }
 
+/**
+ * A titlebar column toggle: one button whose icon, tooltip, accessible name and
+ * `aria-expanded` all read from the same boolean, in both directions.
+ *
+ * The sidebar's toggle used to be Astryx's `SideNavCollapseButton`, wired
+ * across the tree by a `handleRef` so a click reached SideNav's internal
+ * collapse state, which called `onCollapsedChange`, which set the shell state
+ * that was already being passed back down as `isCollapsed`. Three hops to a
+ * setter the shell holds directly — and none of the component's own outputs
+ * survived: the shell overrode its label and its icon, its `isCollapsible`
+ * check could not fail (the ref reads `null` on first render and falls back to
+ * `true`), and its mobile branch is unreachable behind `breakpoint: 'none'`.
+ * What is left after removing all of that is this button, which is also exactly
+ * what the workbar's toggle already was.
+ */
+function ChromeColumnToggle(props: {
+  collapsed: boolean;
+  expandLabel: string;
+  collapseLabel: string;
+  expandIcon: typeof Search;
+  collapseIcon: typeof Search;
+  onToggle(): void;
+}) {
+  const label = props.collapsed ? props.expandLabel : props.collapseLabel;
+  return (
+    <Tooltip content={label}>
+      <IconButton
+        label={label}
+        icon={<ChromeIcon icon={props.collapsed ? props.expandIcon : props.collapseIcon} />}
+        variant="ghost"
+        size="md"
+        className="maka-titlebar-action"
+        onClick={props.onToggle}
+        aria-expanded={!props.collapsed}
+      />
+    </Tooltip>
+  );
+}
+
 export function AppShellTopbarActions(props: {
   sidebarCollapsed: boolean;
-  sidebarHandleRef: RefObject<SideNavImperativeCollapseHandle | null>;
+  onToggleSidebar(): void;
   /* Settings has its own navigation column; the session-sidebar toggle is
      meaningless there. */
   sidebarToggleHidden?: boolean;
@@ -47,7 +72,7 @@ export function AppShellTopbarActions(props: {
   const locale = useUiLocale();
   const copy = getShellCopy(locale).chrome;
   return (
-    <div className="maka-shell-topbar-rail" data-maka-contract="shell-topbar-rail" aria-label={copy.windowActions}>
+    <div className="maka-shell-topbar-rail" data-maka-contract="shell-topbar-rail" role="group" aria-label={copy.windowActions}>
       <Tooltip content={copy.searchConversations}>
         <IconButton
           label={copy.searchConversations}
@@ -60,20 +85,14 @@ export function AppShellTopbarActions(props: {
         />
       </Tooltip>
       {!props.sidebarToggleHidden && (
-      <Tooltip content={props.sidebarCollapsed ? copy.expandSidebar : copy.collapseSidebar}>
-        <SideNavCollapseButton
-          handleRef={props.sidebarHandleRef}
-          label={props.sidebarCollapsed ? copy.expandSidebar : copy.collapseSidebar}
-          className="maka-titlebar-action"
-          aria-expanded={!props.sidebarCollapsed}
-        >
-          {props.sidebarCollapsed ? (
-            <ChromeIcon icon={PanelLeftOpen} />
-          ) : (
-            <ChromeIcon icon={PanelLeftClose} />
-          )}
-        </SideNavCollapseButton>
-      </Tooltip>
+        <ChromeColumnToggle
+          collapsed={props.sidebarCollapsed}
+          expandLabel={copy.expandSidebar}
+          collapseLabel={copy.collapseSidebar}
+          expandIcon={PanelLeftOpen}
+          collapseIcon={PanelLeftClose}
+          onToggle={props.onToggleSidebar}
+        />
       )}
       {/* Collapsed "new task" lives on the SideNav rail (SessionSidebarNav),
           not here — a third titlebar button duplicated the rail icon and made
@@ -82,69 +101,48 @@ export function AppShellTopbarActions(props: {
   );
 }
 
+/**
+ * The titlebar's right edge.
+ *
+ * It used to also carry a `…` menu holding 问题反馈 / 打开命令面板 / 打开帮助 /
+ * 打开健康中心 — a drawer of four things that each belong somewhere else.
+ * 健康中心 was a duplicate of the Settings nav entry, 问题反馈 only opened
+ * Settings → 关于, and the other two now have real homes: the keyboard sheet is
+ * a row on 关于, and the palette keeps ⌘K, which that sheet documents.
+ *
+ * What is left is the workbar toggle — the right-hand mirror of the sidebar
+ * toggle above, down to the component: one control that stays put across its
+ * own state change. It used to hand itself off to a second button inside the
+ * workbar's tab row while the workbar was open, so the single control a user
+ * clicks twice moved ~30px down and left between those two clicks.
+ *
+ * The titlebar is also the only row in the app that already knows where the
+ * platform's native window controls are: `.maka-window-titlebar` reserves
+ * `env(titlebar-area-*)` on both sides, so this button clears the macOS traffic
+ * lights and the Windows caption strip without either platform being named
+ * here. A toggle parked anywhere else would have to restate that.
+ */
 export function AppShellWorkspaceTopActions(props: {
   workbarAvailable: boolean;
   workbarCollapsed: boolean;
   onToggleWorkbar(): void;
-  onOpenFeedback(): void;
-  onOpenPalette(): void;
-  onOpenHelp(): void;
-  onOpenHealth(): void;
 }) {
   const locale = useUiLocale();
   const copy = getShellCopy(locale).chrome;
-  const workbarLabel = props.workbarCollapsed ? copy.expandWorkbar : copy.collapseWorkbar;
-  const pendingMenuIntentRef = useRef<(() => void) | null>(null);
-  const [menuOpen, setMenuOpen] = useState(false);
-
-  const scheduleAfterMenuClose = (intent: () => void) => {
-    pendingMenuIntentRef.current = intent;
-  };
+  // Nothing to toggle outside a session; an empty no-drag rectangle in the
+  // titlebar would only subtract from the window's drag surface.
+  if (!props.workbarAvailable) return null;
 
   return (
     <div className="maka-workspace-top-actions" role="toolbar" aria-label={copy.workspaceActions}>
-      <DropdownMenu
-        isMenuOpen={menuOpen}
-        onOpenChange={(open) => {
-          setMenuOpen(open);
-          if (open) return;
-          const intent = pendingMenuIntentRef.current;
-          pendingMenuIntentRef.current = null;
-          if (intent) window.requestAnimationFrame(intent);
-        }}
-        button={{
-          label: copy.moreActions,
-          icon: <ChromeIcon icon={MoreHorizontal} />,
-          isIconOnly: true,
-          variant: 'ghost',
-          size: 'md',
-          className: 'maka-titlebar-action',
-        }}
-      >
-          <DropdownMenuItem icon={<ChromeIcon icon={MessageCircleQuestion} />} label={copy.feedback} onClick={() => scheduleAfterMenuClose(props.onOpenFeedback)} />
-          <DropdownMenuItem icon={<ChromeIcon icon={Grid3X3} />} label={copy.openCommandPalette} onClick={() => scheduleAfterMenuClose(props.onOpenPalette)} />
-          <DropdownMenuItem icon={<ChromeIcon icon={HelpCircle} />} label={copy.openHelp} onClick={() => scheduleAfterMenuClose(props.onOpenHelp)} />
-          <DropdownMenuItem icon={<ChromeIcon icon={CircleGauge} />} label={copy.openHealth} onClick={() => scheduleAfterMenuClose(props.onOpenHealth)} />
-      </DropdownMenu>
-      {props.workbarAvailable && (
-        <Tooltip content={workbarLabel}>
-          <IconButton
-            label={workbarLabel}
-            icon={
-              props.workbarCollapsed ? (
-                <ChromeIcon icon={PanelRightOpen} />
-              ) : (
-                <ChromeIcon icon={PanelRightClose} />
-              )
-            }
-            variant="ghost"
-            size="md"
-            className="maka-titlebar-action"
-            onClick={props.onToggleWorkbar}
-            aria-expanded={!props.workbarCollapsed}
-          />
-        </Tooltip>
-      )}
+      <ChromeColumnToggle
+        collapsed={props.workbarCollapsed}
+        expandLabel={copy.expandWorkbar}
+        collapseLabel={copy.collapseWorkbar}
+        expandIcon={PanelRightOpen}
+        collapseIcon={PanelRightClose}
+        onToggle={props.onToggleWorkbar}
+      />
     </div>
   );
 }

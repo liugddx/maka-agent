@@ -2096,7 +2096,13 @@ describe('runHarborCell', () => {
       for (const expected of ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep']) {
         assert.ok(toolNames.includes(expected), `expected provider schema tool ${expected}`);
       }
-      for (const unexpected of ['agent_spawn', 'agent_swarm', 'agent_list', 'agent_output']) {
+      for (const unexpected of [
+        'WebSearch',
+        'agent_spawn',
+        'agent_swarm',
+        'agent_list',
+        'agent_output',
+      ]) {
         assert.ok(!toolNames.includes(unexpected), `unexpected default Agent tool ${unexpected}`);
       }
       assert.match(
@@ -2132,6 +2138,82 @@ describe('runHarborCell', () => {
       assert.deepEqual(scopedInput.toolAvailability, { economy: true, groups: [] });
       for (const capability of AGENT_RUNTIME_CAPABILITIES) {
         assert.equal(scopedInput[capability], undefined, `unexpected scoped ${capability}`);
+      }
+    });
+  });
+
+  test('Harbor opt-in routes native WebSearch over Responses and Anthropic Messages', async () => {
+    await withDirs(async ({ workspaceDir, artifactStore }) => {
+      const toolExecutor = fakeToolExecutor();
+      for (const wire of [
+        {
+          provider: 'deepseek',
+          providerToolKind: 'openai-web-search',
+          env: {
+            DEEPSEEK_API_KEY: 'test-key',
+            MAKA_WEB_SEARCH_ENABLED: 'true',
+          },
+        },
+        {
+          provider: 'anthropic-compatible',
+          providerToolKind: 'anthropic-web-search-20250305',
+          env: {
+            MAKA_HOST_API_KEY: 'test-key',
+            MAKA_HOST_BASE_URL: 'https://api.deepseek.com/anthropic',
+            MAKA_WEB_SEARCH_ENABLED: 'true',
+          },
+        },
+      ] as const) {
+        const registry = new BackendRegistry();
+        const register = buildAiSdkCellBackendRegistration({
+          provider: wire.provider,
+          model: 'deepseek-v4-flash',
+          env: wire.env,
+          now: () => 123,
+          newId: () => 'id',
+        });
+        await registerProjectedAiSdkBackend(register, registry, {
+          config: {
+            id: `harbor-native-search-${wire.provider}`,
+            backend: 'ai-sdk',
+            llmConnectionSlug: wire.provider,
+            model: 'deepseek-v4-flash',
+            systemPrompt: DEFAULT_HEADLESS_SYSTEM_PROMPT,
+          },
+          task: { id: 'harbor-cell', instruction: 'search', workspaceDir },
+          storageRoot: workspaceDir,
+          workspaceDir,
+          artifactStore,
+          realBackendIsolation: {
+            kind: 'external',
+            label: 'Harbor task container',
+            toolExecutor,
+          },
+          toolExecutor,
+          ...createHeadlessSessionCapabilityBridge().capabilities,
+        });
+
+        const rootBackend = await registry.build('ai-sdk', backendContext(workspaceDir));
+        const rootInput = (rootBackend as unknown as { input: AiSdkBackendInput }).input;
+        const rootWebSearch = rootInput.tools.find((tool) => tool.name === 'WebSearch');
+        assert.equal(rootWebSearch?.providerTool?.kind, wire.providerToolKind);
+
+        const scopedBackend = await registry.build('ai-sdk', {
+          ...backendContext(workspaceDir),
+          tools: [
+            {
+              name: 'ReadOnlyProbe',
+              description: 'Read-only test probe',
+              parameters: {},
+              impl: () => 'ok',
+            },
+          ],
+        });
+        const scopedInput = (scopedBackend as unknown as { input: AiSdkBackendInput }).input;
+        assert.deepEqual(
+          scopedInput.tools.map((tool) => tool.name),
+          ['ReadOnlyProbe'],
+        );
       }
     });
   });
@@ -4850,6 +4932,47 @@ describe('createHarborHttpToolExecutor', () => {
     }
   });
 
+  test('applies the operator command-timeout floor over the bridge too', async () => {
+    // MAKA_CELL_COMMAND_TIMEOUT_MS reached the local executor and was dropped on
+    // the floor here, so the same env var raised the per-command ceiling in
+    // container mode and did nothing in host-cell mode — the mode the benchmark
+    // actually runs. maka_agent.py forwards it either way.
+    const previousFetch = globalThis.fetch;
+    const bodies: Array<Record<string, unknown>> = [];
+    try {
+      globalThis.fetch = async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify({ exitCode: 0, stdout: '', stderr: '' }), {
+          status: 200,
+        });
+      };
+      const executor = createMockedHarborHttpToolExecutor({
+        MAKA_HARBOR_TOOL_EXECUTOR_URL: 'http://127.0.0.1:1',
+        MAKA_HARBOR_TOOL_EXECUTOR_TOKEN: 'test-token',
+        MAKA_CELL_COMMAND_TIMEOUT_MS: '600000',
+      });
+
+      // A command that asks for nothing inherits the operator's floor.
+      await executor.exec({ command: 'make', cwd: '/workspace' });
+      assert.equal(bodies.at(-1)?.timeoutMs, 600_000);
+
+      // A command that asks for its own timeout still owns it, in both directions.
+      await executor.exec({ command: 'ls', cwd: '/workspace', timeoutMs: 5_000 });
+      assert.equal(bodies.at(-1)?.timeoutMs, 5_000);
+
+      // Unset leaves the field off entirely so the bridge's own default stands as
+      // the single fallback rather than being shadowed by a second one here.
+      const bare = createMockedHarborHttpToolExecutor({
+        MAKA_HARBOR_TOOL_EXECUTOR_URL: 'http://127.0.0.1:1',
+        MAKA_HARBOR_TOOL_EXECUTOR_TOKEN: 'test-token',
+      });
+      await bare.exec({ command: 'make', cwd: '/workspace' });
+      assert.equal(Object.hasOwn(bodies.at(-1) ?? {}, 'timeoutMs'), false);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   test('uses a long-running dispatcher without replacing active-tool cancellation', async () => {
     const previousFetch = globalThis.fetch;
     const controller = new AbortController();
@@ -4890,7 +5013,6 @@ describe('createHarborHttpToolExecutor', () => {
         command: 'sleep until cancelled',
         cwd: '/workspace',
         timeoutMs: 600_000,
-        timeoutSec: 600,
       });
     } finally {
       globalThis.fetch = previousFetch;

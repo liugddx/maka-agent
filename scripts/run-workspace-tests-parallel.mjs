@@ -27,6 +27,11 @@ const defaultRepoRoot = dirname(dirname(scriptPath));
 // handled inside scripts/run-headless-tests.mjs; serial scheduling is extra
 // conservatism for root orchestration, not a claim that its suite shares FS
 // state with other packages.
+//
+// Additions to this list need a measured, precisely stated reason. runtime
+// and runtime-host sat here temporarily while three tests relied on fixed
+// waits that missed their window under load; #2132 replaced those waits with
+// explicit barriers and the entries came out again.
 export const SERIAL_WORKSPACE_DIRS = ['packages/headless'];
 export const DEFAULT_WORKSPACE_TIMEOUT_MS = 15 * 60_000;
 
@@ -216,8 +221,34 @@ export async function runWorkspaceTests(options = {}) {
     await runSerial(workspaceDirs, runOptions);
   } else {
     const { parallel, serial } = partitionWorkspaces(workspaceDirs, serialDirs);
-    await runParallel(parallel, runOptions, concurrency);
-    await runSerial(serial, runOptions);
+    // The serial batch runs even when the parallel batch failed, and both
+    // results are reported together.
+    //
+    // It used to be a plain `await` pair, so one failing parallel workspace
+    // threw before the serial batch started and those suites silently did not
+    // run — the summary looked shorter and finished sooner, which reads as
+    // "faster and greener" rather than "three packages were skipped". That is
+    // the wrong direction for a runner whose entire job is to say what passed.
+    //
+    // Cancellation still stops everything at once: an aborted signal skips the
+    // serial batch, because there the caller has asked for no further work.
+    let parallelError;
+    try {
+      await runParallel(parallel, runOptions, concurrency);
+    } catch (error) {
+      parallelError = error;
+    }
+    if (runOptions.signal?.aborted) throw parallelError ?? workspaceRunCancelledError();
+    let serialError;
+    try {
+      await runSerial(serial, runOptions);
+    } catch (error) {
+      serialError = error;
+    }
+    const errors = [parallelError, serialError].filter(Boolean);
+    if (errors.length > 0) {
+      throw new Error(errors.map((error) => error?.message ?? String(error)).join('\n'));
+    }
   }
 }
 

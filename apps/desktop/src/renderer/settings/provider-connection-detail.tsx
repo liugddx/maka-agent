@@ -10,6 +10,7 @@ import {
   useUiLocale,
 } from '@maka/ui';
 import { PasswordInput } from './password-input';
+import { SettingsExpandableRow } from './settings-expandable-row';
 import { getProviderSettingsCopy } from '../locales/settings-provider-copy';
 import { providerDisplay } from './provider-display';
 import { EnabledModelManager } from './provider-enabled-model-manager';
@@ -43,6 +44,7 @@ function UnknownConnectionDetail({ props }: { props: ConnectionDetailProps }) {
   const toast = useToast();
   const mounted = useMountedRef();
   const [deleting, setDeleting] = useState(false);
+  // NOT clickAction — see the note on the button below.
   async function remove() {
     if (deleting) return;
     const ok = await toast.confirm({
@@ -68,7 +70,15 @@ function UnknownConnectionDetail({ props }: { props: ConnectionDetailProps }) {
   return (
     <VStack gap={3} hAlign="start">
       <Text>{copy.unknownDescription(connection.providerType)}</Text>
-      <Button variant="destructive" onClick={remove} isDisabled={deleting} label={deleting ? copy.deleting : copy.deleteUnused} />
+      {/* onClick, not clickAction: this handler awaits `toast.confirm`, and
+          clickAction runs inside startTransition. React defers state commits
+          made during an async transition until the action settles, so the
+          confirm dialog — which is React state, and needs four commits to
+          resolve its promise — can never render, and the action waits forever
+          on a dialog that waits on the action. `isLoading` still gives the
+          spinner, aria-busy, and the disable, so the label stays 删除 rather
+          than renaming itself to 删除中… . */}
+      <Button variant="destructive" onClick={() => void remove()} isLoading={deleting} label={copy.deleteUnused} />
     </VStack>
   );
 }
@@ -206,14 +216,15 @@ function ConnectionDetailInner(props: ConnectionDetailProps) {
           <VStack gap={0}>
             <Divider />
             {supportsApiKey && (
-              <ExpandableSettingRow
+              <>
+              <SettingsExpandableRow
                 label={copy.modelKey}
                 value={apiKeyStatusHint}
                 actionLabel={hasSecret === true ? copy.change : copy.set}
                 isEditing={editingRow === 'key'}
                 isDisabled={detailActionBusy}
                 canSave={hasApiKeyChange}
-                saveLabel={busy ? copy.saving : copy.save}
+                saveLabel={copy.save}
                 cancelLabel={copy.cancel}
                 onEdit={() => openRow('key')}
                 onCancel={() => { setApiKey(''); setEditingRow(null); }}
@@ -237,17 +248,20 @@ function ConnectionDetailInner(props: ConnectionDetailProps) {
                     {copy.getModelKey}
                   </Link>
                 )}
-              </ExpandableSettingRow>
+              </SettingsExpandableRow>
+              <Divider />
+              </>
             )}
             {showsEndpoint && (
-              <ExpandableSettingRow
+              <>
+              <SettingsExpandableRow
                 label={copy.endpoint}
                 value={savedBaseUrl || copy.endpointDefault}
                 actionLabel={copy.edit}
                 isEditing={editingRow === 'endpoint'}
                 isDisabled={detailActionBusy}
                 canSave={hasBaseUrlChange}
-                saveLabel={busy ? copy.saving : copy.save}
+                saveLabel={copy.save}
                 cancelLabel={copy.cancel}
                 onEdit={() => openRow('endpoint')}
                 onCancel={() => { setBaseUrl(savedBaseUrl); setEditingRow(null); }}
@@ -261,7 +275,9 @@ function ConnectionDetailInner(props: ConnectionDetailProps) {
                   placeholder={defaults.baseUrl}
                   isDisabled={detailActionBusy}
                 />
-              </ExpandableSettingRow>
+              </SettingsExpandableRow>
+              <Divider />
+              </>
             )}
           </VStack>
         )}
@@ -277,10 +293,16 @@ function ConnectionDetailInner(props: ConnectionDetailProps) {
           disabled={detailActionBusy}
           onChange={(next) => void updateEnabledModels(next)}
         />
+        {/* Each button reports its own work through clickAction (spinner +
+            aria-busy + "Loading" announcement) instead of renaming itself to
+            测试中… — the section's `detailActionBusy` still says only one
+            connection action runs at a time. `refreshModels` is wrapped
+            because it takes an options object: handing it the click event
+            would pass a MouseEvent as `opts`. */}
         <HStack gap={2} vAlign="center" wrap="wrap">
-          <Button variant="secondary" isDisabled={detailActionBusy || !hasUsableCredential} onClick={runTest} label={testing ? copy.testing : copy.testConnection} />
+          <Button variant="secondary" isDisabled={detailActionBusy || !hasUsableCredential} clickAction={() => runTest()} label={copy.testConnection} />
           {supportsRemoteDiscovery && (
-            <Button variant="ghost" isDisabled={detailActionBusy || !hasUsableCredential} onClick={() => void refreshModels()} label={fetchingModels ? copy.updating : copy.updateModels} />
+            <Button variant="ghost" isDisabled={detailActionBusy || !hasUsableCredential} clickAction={() => refreshModels()} label={copy.updateModels} />
           )}
         </HStack>
       </DetailSection>
@@ -291,7 +313,12 @@ function ConnectionDetailInner(props: ConnectionDetailProps) {
         <HStack>
           {/* The heading beside it already says 删除连接; repeating it on the
               button was the same three words twice in one row. */}
-          <Button variant="destructive" isDisabled={detailActionBusy} onClick={remove} label={deleting ? copy.deleting : copy.delete} />
+          {/* onClick, not clickAction: `remove` awaits toast.confirm, which
+              cannot render from inside clickAction's transition (see the
+              fallback detail above). `deleting` already drives
+              detailActionBusy; feeding it to isLoading puts the spinner on
+              the button that is actually working. */}
+          <Button variant="destructive" isDisabled={detailActionBusy} isLoading={deleting} onClick={() => void remove()} label={copy.delete} />
         </HStack>
       </DetailSection>
     </VStack>
@@ -305,63 +332,6 @@ function ConnectionDetailInner(props: ConnectionDetailProps) {
  * as heading → sentence → controls; it splits into two columns for free if the
  * shell ever widens.
  */
-/**
- * A settled value: its name, what it currently is, and one link to change it.
- * Editing swaps the row in place for the control plus save / cancel — the
- * settings-sidebar template's ExpandableRow, which is the shape Astryx uses for
- * exactly this (a password that is already set, an address already on file).
- *
- * The Divider trails each row, as in the template, so a stack of rows carries
- * its own separators without the caller interleaving them.
- */
-function ExpandableSettingRow(props: {
-  label: string;
-  value: string;
-  actionLabel: string;
-  isEditing: boolean;
-  isDisabled: boolean;
-  canSave: boolean;
-  saveLabel: string;
-  cancelLabel: string;
-  onEdit(): void;
-  onCancel(): void;
-  onSave(): void | Promise<void>;
-  children: ReactNode;
-}) {
-  return (
-    <>
-      {props.isEditing ? (
-        <VStack gap={3} paddingBlock={4}>
-          <Text type="body" weight="semibold">{props.label}</Text>
-          {props.children}
-          <HStack gap={2}>
-            <Button
-              variant="primary"
-              isDisabled={props.isDisabled || !props.canSave}
-              onClick={() => void props.onSave()}
-              label={props.saveLabel}
-            />
-            <Button variant="ghost" isDisabled={props.isDisabled} onClick={props.onCancel} label={props.cancelLabel} />
-          </HStack>
-        </VStack>
-      ) : (
-        <HStack hAlign="between" vAlign="start" gap={4} paddingBlock={4}>
-          <VStack gap={0}>
-            <Text type="body" weight="semibold">{props.label}</Text>
-            <Text type="supporting" color="secondary">{props.value}</Text>
-          </VStack>
-          {/* A button, not a Link: this opens a form, it does not navigate. As
-              a link it announced itself as one, ignored Space, and pointed at
-              "#". Astryx has no link-styled variant, and ghost is the right
-              weight for a row affordance anyway. */}
-          <Button variant="ghost" size="sm" isDisabled={props.isDisabled} onClick={props.onEdit} label={props.actionLabel} />
-        </HStack>
-      )}
-      <Divider />
-    </>
-  );
-}
-
 function DetailSection(props: { title: string; description: string; children: ReactNode }) {
   return (
     /* `columnGap`, not `gap`: the template's 10 is the gutter BETWEEN the two
@@ -393,7 +363,10 @@ function GitHubCopilotReloginNotice(props: {
 }) {
   const locale = useUiLocale();
   const copy = getProviderSettingsCopy(locale).detail;
-  const [busy, setBusy] = useState(false);
+  // connectGuard stays: it survives this component's renders and is the
+  // cross-render "one connect at a time" record. The `busy` state it used to
+  // mirror is gone — one button, so clickAction's own disable and spinner are
+  // the whole visible story.
   const connectGuard = useActionGuard<'connect'>();
   const mountedRef = useMountedRef();
   const toast = useToast();
@@ -402,7 +375,6 @@ function GitHubCopilotReloginNotice(props: {
 
   async function connect() {
     if (!connectGuard.begin('connect')) return;
-    setBusy(true);
     try {
       const result = await window.maka.githubCopilotSubscription.connectExistingLogin();
       if (!result.ok) {
@@ -416,7 +388,6 @@ function GitHubCopilotReloginNotice(props: {
       }
     } finally {
       connectGuard.finish();
-      if (mountedRef.current) setBusy(false);
     }
   }
 
@@ -426,7 +397,7 @@ function GitHubCopilotReloginNotice(props: {
       title={loggedIn ? copy.copilotLoggedIn : loading ? copy.oauthLoading : copy.copilotWaiting}
       description={loggedIn ? copy.copilotLoggedInDetail : copy.copilotWaitingDetail}
       endContent={!loading ? (
-          <Button variant="primary" size="sm" isDisabled={busy} onClick={() => void connect()} label={busy ? copy.importing : loggedIn ? copy.reimport : copy.importCredential} />
+          <Button variant="primary" size="sm" clickAction={() => connect()} label={loggedIn ? copy.reimport : copy.importCredential} />
       ) : undefined} />
   );
 }

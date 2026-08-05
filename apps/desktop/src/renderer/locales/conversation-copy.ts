@@ -67,9 +67,14 @@ export interface DesktopConversationCopy {
     retry: string;
     empty: string;
     costUnavailable: string;
-    attempts: string;
-    retries: string;
-    compactions: string;
+    /** Labels for the totals strip; each names the figure beside it. */
+    totals: {
+      duration: string;
+      calls: string;
+      retries: string;
+      compactions: string;
+      cost: string;
+    };
     coveragePartial: string;
     coverageAbsent: string;
     unreadable: string;
@@ -77,6 +82,12 @@ export interface DesktopConversationCopy {
     turnsShort: string;
     recovered: string;
     turnFailed: string;
+    filterLabel: string;
+    filterPlaceholder: string;
+    filterFailedOnly: string;
+    filterClear: string;
+    noMatches: string;
+    hiddenByFilter: string;
   };
   quoteCompanion: {
     /** Read-only exploration hint shown in the empty companion panel. */
@@ -162,9 +173,13 @@ const COPY = {
       retry: '重试',
       empty: '这个会话还没有可追踪的活动',
       costUnavailable: '费用不可得',
-      attempts: '次调用',
-      retries: '次重试',
-      compactions: '次压缩',
+      totals: {
+        duration: '总耗时',
+        calls: '模型调用',
+        retries: '重试',
+        compactions: '上下文压缩',
+        cost: '花费',
+      },
       coveragePartial: '部分调用没有记录，下面的数字是下界',
       coverageAbsent: '该后端不上报逐次调用明细',
       unreadable: '条记录无法解析',
@@ -172,6 +187,12 @@ const COPY = {
       turnsShort: '轮记录数少于步数',
       recovered: '已恢复',
       turnFailed: '本轮失败',
+      filterLabel: '筛选追踪',
+      filterPlaceholder: '按工具、模型或轮次筛选',
+      filterFailedOnly: '仅失败',
+      filterClear: '清除筛选',
+      noMatches: '没有匹配的步骤——这个会话本身是有内容的',
+      hiddenByFilter: '项被筛选隐藏',
     },
     quoteCompanion: {
       hint: '这里的追问会带上主对话的完整上下文：只做解释和只读探索，不会改动文件，也不写回主对话。在主对话里继续选中文本追问，会加进这个侧栏。',
@@ -242,9 +263,13 @@ const COPY = {
       retry: 'Retry',
       empty: 'Nothing to trace in this session yet',
       costUnavailable: 'cost unavailable',
-      attempts: 'calls',
-      retries: 'retries',
-      compactions: 'compactions',
+      totals: {
+        duration: 'Duration',
+        calls: 'Model calls',
+        retries: 'Retries',
+        compactions: 'Compactions',
+        cost: 'Cost',
+      },
       coveragePartial: 'Some calls have no record; the numbers below are a floor',
       coverageAbsent: 'This backend does not report per-call detail',
       unreadable: 'unreadable records',
@@ -252,6 +277,12 @@ const COPY = {
       turnsShort: 'turns short of their step count',
       recovered: 'recovered',
       turnFailed: 'Turn failed',
+      filterLabel: 'Filter the trace',
+      filterPlaceholder: 'Filter by tool, model or turn',
+      filterFailedOnly: 'Failed only',
+      filterClear: 'Clear filter',
+      noMatches: 'Nothing matches this filter — the session itself is not empty',
+      hiddenByFilter: 'hidden by the filter',
     },
     quoteCompanion: {
       hint: 'Questions here carry the full context of the main conversation: read-only exploration and explanation, no file changes, and nothing is written back to the main conversation. Select more text in the main transcript to add it to this side panel.',

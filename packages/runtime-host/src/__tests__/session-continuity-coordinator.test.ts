@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { setImmediate as delayImmediate } from 'node:timers/promises';
 import test from 'node:test';
-import type { SessionEvent, SessionHeader } from '@maka/core';
+import type { SessionEvent, SessionHeader, ShellRunUpdate, StoredMessage } from '@maka/core';
 import { TOOL_OUTPUT_DELTA_MAX_CHARS } from '@maka/core/events';
 import { PiAgentBackend, type PiAgentTransport } from '@maka/runtime';
 import {
@@ -9,6 +9,7 @@ import {
   encodeProtocolFrame,
   ProtocolFrameDecoder,
   RUNTIME_HOST_MAX_FRAME_BYTES,
+  type SessionTranscriptCursor,
   type SubscriptionFrame,
 } from '../protocol/index.js';
 import type { ConnectionContext } from '../server/operation-dispatcher.js';
@@ -333,6 +334,79 @@ test('coalesces Agent graph invalidations onto the Session subscription sequence
   coordinator.close();
 });
 
+test('coalesces typed domain invalidations without publishing continuity projections', async () => {
+  const coordinator = new SessionContinuityCoordinator(
+    HOST_EPOCH,
+    async () => canonical(),
+    new SessionAdmissionGate(),
+  );
+  const sink = new RecordingSink();
+  const connection = coordinator.attachConnection('connection-1', sink);
+  const opened = await open(coordinator, 'connection-1');
+  connection.activate(opened.subscriptionId);
+
+  coordinator.enqueueSessionDomainChanged(SESSION_ID, 'task');
+  coordinator.enqueueSessionDomainChanged(SESSION_ID, 'task');
+  coordinator.enqueueSessionDomainChanged(SESSION_ID, 'plan');
+  await waitFor(() => sink.frames.length === 2);
+
+  assert.deepEqual(
+    sink.frames.map((frame) =>
+      frame.kind === 'subscription.session_domain_changed'
+        ? { kind: frame.kind, sequence: frame.sequence, domain: frame.domain }
+        : frame.kind,
+    ),
+    [
+      { kind: 'subscription.session_domain_changed', sequence: 1, domain: 'task' },
+      { kind: 'subscription.session_domain_changed', sequence: 2, domain: 'plan' },
+    ],
+  );
+  coordinator.close();
+});
+
+test('fans one bounded Runtime Resource burst out to an inherited Session view', async () => {
+  const childSessionId = 'child-session';
+  const coordinator = new SessionContinuityCoordinator(
+    HOST_EPOCH,
+    async (sessionId) => canonicalFor(sessionId),
+    new SessionAdmissionGate(),
+  );
+  const sink = new RecordingSink();
+  const connection = coordinator.attachConnection('connection-1', sink);
+  const outcome = await coordinator.handlers['subscription.open'](
+    { sessionId: childSessionId },
+    connectionContext('connection-1'),
+  );
+  assert.equal(outcome.ok, true);
+  if (!outcome.ok) return;
+  connection.activate(outcome.result.subscriptionId);
+  const updates = Array.from({ length: 64 }, (_, index) => {
+    const update = shellRunUpdate({
+      sessionId: 'parent-session',
+      sourceToolCallId: `tool-${index}`,
+    });
+    update.result.ref = `shell:run-${index}`;
+    return update;
+  });
+
+  for (const update of updates) coordinator.enqueueRuntimeResourceChanged(update);
+  await waitFor(() => sink.frames.length === 1);
+
+  assert.deepEqual(sink.frames[0], {
+    kind: 'subscription.session_domain_changed',
+    hostEpoch: HOST_EPOCH,
+    subscriptionId: outcome.result.subscriptionId,
+    sequence: 1,
+    sessionId: childSessionId,
+    domain: 'runtime_resource',
+    resources: updates.map((update) => ({
+      sourceSessionId: update.sessionId,
+      ref: update.result.ref,
+    })),
+  });
+  coordinator.close();
+});
+
 test('slow subscriber receives a terminal eviction without delaying another subscriber', async () => {
   const coordinator = new SessionContinuityCoordinator(
     HOST_EPOCH,
@@ -407,6 +481,160 @@ test('removal closes every Session subscriber at the admitted sequence boundary'
   coordinator.close();
 });
 
+test('a joining Client receives an immutable transcript and absolute overlapping live offsets', async () => {
+  const transcript: StoredMessage[] = [assistantMessage('chunk-1')];
+  const coordinator = new SessionContinuityCoordinator(
+    HOST_EPOCH,
+    async () => canonical(),
+    new SessionAdmissionGate(),
+    undefined,
+    async () => transcript,
+  );
+
+  await coordinator.acceptRuntimeEvent(SESSION_ID, 'run-1', textEvent(1));
+  const sink = new RecordingSink();
+  const connection = coordinator.attachConnection('connection-1', sink);
+  const opened = await open(coordinator, 'connection-1');
+  connection.activate(opened.subscriptionId);
+
+  const snapshot = await coordinator.handlers['session.transcript.query'](
+    { kind: 'start', subscriptionId: opened.subscriptionId },
+    connectionContext('connection-1'),
+  );
+  assert.equal(snapshot.ok, true);
+  if (!snapshot.ok) assert.fail('expected the transcript snapshot');
+  assert.equal(snapshot.result.kind, 'chunk');
+  if (snapshot.result.kind !== 'chunk') assert.fail('expected a transcript chunk');
+  assert.deepEqual(
+    JSON.parse(Buffer.from(snapshot.result.data, 'base64').toString('utf8')),
+    transcript[0],
+  );
+
+  transcript[0] = assistantMessage('mutated after snapshot');
+  await coordinator.acceptRuntimeEvent(SESSION_ID, 'run-1', textEvent(2));
+  await waitFor(() => sink.frames.length === 1);
+  const live = sink.frames[0];
+  assert.equal(live?.kind, 'subscription.session_delta');
+  if (live?.kind === 'subscription.session_delta') {
+    assert.equal(live.delta.startOffset, 'chunk-1'.length);
+    assert.equal(live.delta.text, 'chunk-2');
+  }
+  coordinator.close();
+});
+
+test('transcript snapshots chunk one large message and remain subscription-owned', async () => {
+  const message = assistantMessage('界'.repeat(20_000));
+  const coordinator = new SessionContinuityCoordinator(
+    HOST_EPOCH,
+    async () => canonical(),
+    new SessionAdmissionGate(),
+    undefined,
+    async () => [message],
+  );
+  const owner = coordinator.attachConnection('connection-owner', new RecordingSink());
+  const sibling = coordinator.attachConnection('connection-sibling', new RecordingSink());
+  const opened = await open(coordinator, 'connection-owner');
+
+  const first = await coordinator.handlers['session.transcript.query'](
+    { kind: 'start', subscriptionId: opened.subscriptionId },
+    connectionContext('connection-owner'),
+  );
+  assert.equal(first.ok, true);
+  if (!first.ok) assert.fail('expected the first transcript chunk');
+  assert.equal(first.result.kind, 'chunk');
+  if (first.result.kind !== 'chunk') assert.fail('expected a transcript chunk');
+  assert.ok(first.result.next, 'expected the large message to require continuation');
+  if (!first.result.next) assert.fail('expected a continuation cursor');
+  const chunks = [Buffer.from(first.result.data, 'base64')];
+  let cursor: SessionTranscriptCursor | null = first.result.next;
+  while (cursor) {
+    const next = await coordinator.handlers['session.transcript.query'](
+      {
+        kind: 'continue',
+        subscriptionId: opened.subscriptionId,
+        snapshotId: first.result.snapshotId,
+        ...cursor,
+      },
+      connectionContext('connection-owner'),
+    );
+    assert.equal(next.ok, true);
+    if (!next.ok) assert.fail('expected a continuation transcript chunk');
+    assert.equal(next.result.kind, 'chunk');
+    if (next.result.kind !== 'chunk') assert.fail('expected a transcript chunk');
+    chunks.push(Buffer.from(next.result.data, 'base64'));
+    cursor = next.result.next;
+  }
+  assert.ok(chunks.length > 1);
+  assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString('utf8')), message);
+
+  const foreign = await coordinator.handlers['session.transcript.query'](
+    { kind: 'start', subscriptionId: opened.subscriptionId },
+    connectionContext('connection-sibling'),
+  );
+  assert.deepEqual(foreign, {
+    ok: false,
+    error: { code: 'not_found', message: 'Session subscription was not found' },
+  });
+  owner.close();
+  sibling.close();
+  coordinator.close();
+});
+
+test('absolute live offsets survive a gap with no connected subscribers', async () => {
+  const coordinator = new SessionContinuityCoordinator(
+    HOST_EPOCH,
+    async () => canonical(),
+    new SessionAdmissionGate(),
+  );
+  const firstConnection = coordinator.attachConnection('connection-first', new RecordingSink());
+  const first = await open(coordinator, 'connection-first');
+  firstConnection.activate(first.subscriptionId);
+  await coordinator.acceptRuntimeEvent(SESSION_ID, 'run-1', textEvent(1));
+  firstConnection.close();
+  await delayImmediate();
+
+  await coordinator.acceptRuntimeEvent(SESSION_ID, 'run-1', textEvent(2));
+  const sink = new RecordingSink();
+  const secondConnection = coordinator.attachConnection('connection-second', sink);
+  const second = await open(coordinator, 'connection-second');
+  secondConnection.activate(second.subscriptionId);
+  await coordinator.acceptRuntimeEvent(SESSION_ID, 'run-1', textEvent(3));
+  await waitFor(() => sink.frames.length === 1);
+
+  const frame = sink.frames[0];
+  assert.equal(frame?.kind, 'subscription.session_delta');
+  if (frame?.kind === 'subscription.session_delta') {
+    assert.equal(frame.delta.startOffset, 'chunk-1'.length + 'chunk-2'.length);
+  }
+  coordinator.close();
+});
+
+test('an in-flight transcript read cannot outlive its owning connection', async () => {
+  const transcript = deferred<readonly StoredMessage[]>();
+  const coordinator = new SessionContinuityCoordinator(
+    HOST_EPOCH,
+    async () => canonical(),
+    new SessionAdmissionGate(),
+    undefined,
+    () => transcript.promise,
+  );
+  const connection = coordinator.attachConnection('connection-1', new RecordingSink());
+  const opened = await open(coordinator, 'connection-1');
+  const reading = coordinator.handlers['session.transcript.query'](
+    { kind: 'start', subscriptionId: opened.subscriptionId },
+    connectionContext('connection-1'),
+  );
+  await delayImmediate();
+  connection.close();
+  transcript.resolve([assistantMessage('late snapshot')]);
+
+  assert.deepEqual(await reading, {
+    ok: false,
+    error: { code: 'not_found', message: 'Session subscription was not found' },
+  });
+  coordinator.close();
+});
+
 class RecordingSink implements SessionContinuityFrameSink {
   readonly frames: SubscriptionFrame[] = [];
 
@@ -463,6 +691,44 @@ function canonical(
       followup: [],
     },
     interactions: overrides.interactions ?? { pending: [] },
+  };
+}
+
+function canonicalFor(sessionId: string): CanonicalSessionProjection {
+  const projection = canonical();
+  return {
+    ...projection,
+    session: { ...projection.session, sessionId },
+    rootTurn: projection.rootTurn ? { ...projection.rootTurn, sessionId } : null,
+  };
+}
+
+function shellRunUpdate(overrides: Partial<ShellRunUpdate> = {}): ShellRunUpdate {
+  return {
+    sessionId: SESSION_ID,
+    ownership: { kind: 'local' },
+    sourceTurnId: 'turn-1',
+    sourceToolCallId: 'tool-1',
+    result: {
+      kind: 'shell_run',
+      ref: 'shell:run-1',
+      mode: 'pipes',
+      status: 'running',
+      cwd: '/workspace',
+      cmd: 'sleep 60',
+      startedAt: 1,
+      updatedAt: 2,
+      revision: 2,
+      output: {
+        mode: 'pipes',
+        stdout: 'ready',
+        stderr: '',
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        redacted: false,
+      },
+    },
+    ...overrides,
   };
 }
 
@@ -523,6 +789,17 @@ function textEvent(index: number) {
     ts: index,
     messageId: 'message-1',
     text: `chunk-${index}`,
+  };
+}
+
+function assistantMessage(text: string): Extract<StoredMessage, { type: 'assistant' }> {
+  return {
+    type: 'assistant',
+    id: 'message-1',
+    turnId: 'turn-1',
+    ts: 1,
+    text,
+    modelId: 'test-model',
   };
 }
 

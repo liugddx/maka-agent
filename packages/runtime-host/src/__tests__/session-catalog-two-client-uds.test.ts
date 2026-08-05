@@ -6,6 +6,7 @@ import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { DEEP_RESEARCH_SESSION_LABEL, DEEP_RESEARCH_SESSION_NAME } from '@maka/core';
 import { openInteractiveArtifactStoreForWrite } from '@maka/storage/artifact-stores';
 import { openInteractiveExecutionStoresForWrite } from '@maka/storage/execution-stores';
 import { openInteractiveRuntimePolicyStoresForWrite } from '@maka/storage/runtime-policy-stores';
@@ -23,6 +24,7 @@ import {
 } from '../client/index.js';
 import {
   decodeHostFrame,
+  RUNTIME_HOST_COMPATIBILITY_EPOCH,
   RUNTIME_HOST_PROTOCOL_VERSION,
   type SessionCatalogItem,
   type SessionCatalogProjection,
@@ -30,6 +32,7 @@ import {
   type SubscriptionFrame,
 } from '../protocol/index.js';
 import { FramedTransport } from '../transport/framed-transport.js';
+import { removePosixEndpointDirectories } from './fixtures/endpoint-hygiene.js';
 
 const CURRENT_PROTOCOL = {
   min: RUNTIME_HOST_PROTOCOL_VERSION,
@@ -173,6 +176,20 @@ test('two UDS Clients share stable Session creation, CAS configuration, and cata
       });
       if ('kind' in planSession) assert.fail('Plan Session must be wire-representable');
       assert.equal(planSession.collaborationMode, 'plan');
+      const researchSession = requireSessionProjection(
+        await desktop.request('session.create', {
+          sessionId: 'deep-research-session',
+          cwd: root,
+          mode: 'deep_research',
+          name: 'Caller override',
+          labels: ['customer-label'],
+          modelTarget: { kind: 'default' },
+          permissionMode: 'bypass',
+        }),
+      );
+      assert.equal(researchSession.name, DEEP_RESEARCH_SESSION_NAME);
+      assert.deepEqual(researchSession.labels, ['customer-label', DEEP_RESEARCH_SESSION_LABEL]);
+      assert.equal(researchSession.permissionMode, 'explore');
 
       const policy = await tui.request('runtime.policy.query', {});
       const changedPolicy = await tui.request('runtime.policy.mutate', {
@@ -366,6 +383,12 @@ test('two UDS Clients share stable Session creation, CAS configuration, and cata
       assert.equal(readFromTui.hasUnread, false);
       assert.equal(readFromTui.lastReadMessageId, 'message-2');
 
+      const catalogBeforeBulk = await desktop.request('session.catalog.query', {
+        kind: 'list_start',
+      });
+      if (catalogBeforeBulk.kind !== 'page' || catalogBeforeBulk.nextCursor !== null) {
+        assert.fail('Pre-bulk Session catalog must fit on one page');
+      }
       const bulk = (
         await Promise.all(
           Array.from({ length: 34 }, (_, index) =>
@@ -394,7 +417,10 @@ test('two UDS Clients share stable Session creation, CAS configuration, and cata
       if (continuation.kind !== 'page') {
         assert.fail('Stable Session catalog continuation must return a page');
       }
-      assert.equal(firstPage.sessions.length + continuation.sessions.length, bulk.length + 6);
+      assert.equal(
+        firstPage.sessions.length + continuation.sessions.length,
+        bulk.length + catalogBeforeBulk.sessions.length,
+      );
 
       const filteredStart = await desktop.request('session.catalog.query', {
         kind: 'list_start',
@@ -1033,6 +1059,7 @@ async function sendCreateWithoutReadingResponse(
     surface: 'desktop',
     protocolMin: CURRENT_PROTOCOL.min,
     protocolMax: CURRENT_PROTOCOL.max,
+    compatibilityEpoch: RUNTIME_HOST_COMPATIBILITY_EPOCH,
   });
   const handshake = decodeHostFrame(await transport.read(2_000));
   assert.ok('kind' in handshake);
@@ -1128,19 +1155,6 @@ function waitForExit(
     child.once('error', onError);
     child.once('exit', onExit);
   });
-}
-
-async function removePosixEndpointDirectories(rootId: string): Promise<void> {
-  if (process.platform === 'win32' || typeof process.getuid !== 'function') return;
-  const prefix = `m-${process.getuid()}-${Buffer.from(rootId, 'hex').toString('base64url')}-`;
-  const entries = await readdir('/tmp', { withFileTypes: true });
-  await Promise.all(
-    entries.map(async (entry) => {
-      if (entry.isDirectory() && entry.name.startsWith(prefix)) {
-        await rm(join('/tmp', entry.name), { recursive: true, force: true });
-      }
-    }),
-  );
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

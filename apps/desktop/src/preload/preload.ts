@@ -6,7 +6,10 @@ import type {
   PermissionActionResult,
   PermissionOverlayStartResult,
   RendererIngestInput,
+  AppUpdateInstallRequest,
+  AppUpdateInstallResult,
   AppUpdateStatus,
+  WindowCommand,
 } from './bridge-contract.js';
 import type {
   ConnectionEvent,
@@ -17,11 +20,11 @@ import type {
   BotOnboardingSnapshot,
   BotOnboardingStartInput,
   HealthSnapshot,
-  ExecutionBoundary,
+  ExecutionBoundaryReadModel,
   LlmConnection,
   ModelDiscoveryResult,
   ModelInfo,
-  SandboxBoundaryRequestEvent,
+  ActiveInteractionRequestEvent,
   SandboxBoundaryResponse,
   UserQuestionResponse,
   PermissionMode,
@@ -87,7 +90,7 @@ import type {
   Task,
   TaskLedgerChangedEvent,
   DeepResearchChangedEvent,
-  DeepResearchRun,
+  DeepResearchClientProgress,
 } from '@maka/core';
 import type { SessionTrace } from '@maka/core/session-trace';
 import type {
@@ -133,7 +136,7 @@ const makaBridge = {
     },
   },
   deepResearch: {
-    get(sessionId: string): Promise<DeepResearchRun | undefined> {
+    get(sessionId: string): Promise<DeepResearchClientProgress | undefined> {
       return ipcRenderer.invoke('deepResearch:get', sessionId);
     },
     subscribeChanges(handler: (event: DeepResearchChangedEvent) => void): () => void {
@@ -240,13 +243,11 @@ const makaBridge = {
     readMessages(sessionId: string): Promise<StoredMessage[]> {
       return ipcRenderer.invoke('sessions:readMessages', sessionId);
     },
-    readExecutionBoundary(sessionId: string): Promise<ExecutionBoundary> {
+    readExecutionBoundary(sessionId: string): Promise<ExecutionBoundaryReadModel> {
       return ipcRenderer.invoke('sessions:readExecutionBoundary', sessionId);
     },
-    listActiveSandboxBoundaryRequests(
-      sessionId: string,
-    ): Promise<SandboxBoundaryRequestEvent[]> {
-      return ipcRenderer.invoke('sessions:listActiveSandboxBoundaryRequests', sessionId);
+    listActiveInteractions(sessionId: string): Promise<ActiveInteractionRequestEvent[]> {
+      return ipcRenderer.invoke('sessions:listActiveInteractions', sessionId);
     },
     listTurns(sessionId: string): Promise<TurnRecord[]> {
       return ipcRenderer.invoke('sessions:listTurns', sessionId);
@@ -284,7 +285,12 @@ const makaBridge = {
       const channel = `sessions:event:${sessionId}`;
       const listener = (_event: Electron.IpcRendererEvent, payload: SessionEvent) => handler(payload);
       ipcRenderer.on(channel, listener);
-      return () => ipcRenderer.off(channel, listener);
+      const observerId = crypto.randomUUID();
+      void ipcRenderer.invoke('sessions:observe', sessionId, observerId).catch(() => undefined);
+      return () => {
+        ipcRenderer.off(channel, listener);
+        void ipcRenderer.invoke('sessions:unobserve', observerId).catch(() => undefined);
+      };
     },
     subscribeChanges(handler: (event: SessionChangedEvent) => void): () => void {
       const listener = (_event: Electron.IpcRendererEvent, payload: SessionChangedEvent) => handler(payload);
@@ -315,6 +321,14 @@ const makaBridge = {
     getPlanState(sessionId: string): Promise<PlanSessionState> {
       return ipcRenderer.invoke('plan-mode:getState', sessionId);
     },
+    subscribePlanChanges(sessionId: string, handler: () => void): () => void {
+      const channel = 'plan-mode:changed';
+      const listener = (_event: Electron.IpcRendererEvent, payload: { sessionId: string }) => {
+        if (payload.sessionId === sessionId) handler();
+      };
+      ipcRenderer.on(channel, listener);
+      return () => ipcRenderer.off(channel, listener);
+    },
     requestPlanRevision(sessionId: string, proposalId: string): Promise<PlanSessionState> {
       return ipcRenderer.invoke('plan-mode:requestRevision', sessionId, proposalId);
     },
@@ -327,16 +341,16 @@ const makaBridge = {
     approvePlan(sessionId: string, input: {
       proposalId: string;
       expectedRevision: number;
-      expectedStoreVersion?: number;
-    }): Promise<{ state: PlanSessionState; turnId: string; executionId: string }> {
+      expectedStoreVersion: number;
+      turnId: string;
+    }): Promise<{ turnId: string; executionId: string }> {
       return ipcRenderer.invoke('plan-mode:approve', sessionId, input);
     },
-    resumePlan(sessionId: string, executionId: string): Promise<{
-      state: PlanSessionState;
+    resumePlan(sessionId: string, executionId: string, turnId: string): Promise<{
       turnId: string;
       executionId: string;
     }> {
-      return ipcRenderer.invoke('plan-mode:resume', sessionId, executionId);
+      return ipcRenderer.invoke('plan-mode:resume', sessionId, executionId, turnId);
     },
     abandonPlanExecution(sessionId: string, executionId: string): Promise<PlanSessionState> {
       return ipcRenderer.invoke('plan-mode:abandonExecution', sessionId, executionId);
@@ -953,6 +967,14 @@ const makaBridge = {
     notifyRendererReady(): Promise<void> {
       return ipcRenderer.invoke('window:notifyRendererReady');
     },
+    // PR-2088: main-to-renderer route for native-menu commands (New Task /
+    // Settings / Keyboard Shortcuts). The `ipcRenderer.on`/`off` idiom keeps
+    // an HMR or shell remount from stacking duplicate listeners.
+    subscribeCommand(handler: (command: WindowCommand) => void): () => void {
+      const listener = (_event: Electron.IpcRendererEvent, command: WindowCommand) => handler(command);
+      ipcRenderer.on('window:command', listener);
+      return () => ipcRenderer.off('window:command', listener);
+    },
   },
   config: {
     export(input: { categories: ConfigCategory[] }): Promise<
@@ -1003,14 +1025,11 @@ const makaBridge = {
     updateStatus(): Promise<AppUpdateStatus> {
       return ipcRenderer.invoke('app:updateStatus');
     },
-    checkForUpdates(): Promise<AppUpdateStatus> {
-      return ipcRenderer.invoke('app:checkForUpdates');
+    retryUpdateDownload(): Promise<AppUpdateStatus> {
+      return ipcRenderer.invoke('app:retryUpdateDownload');
     },
-    downloadUpdate(): Promise<AppUpdateStatus> {
-      return ipcRenderer.invoke('app:downloadUpdate');
-    },
-    installUpdate(): Promise<{ ok: true } | { ok: false; reason: 'not_downloaded' | 'install_failed' }> {
-      return ipcRenderer.invoke('app:installUpdate');
+    installUpdate(input: AppUpdateInstallRequest): Promise<AppUpdateInstallResult> {
+      return ipcRenderer.invoke('app:installUpdate', input);
     },
     openUpdateDownload(): Promise<{ ok: true } | { ok: false; reason: 'not_available' | 'open_failed' }> {
       return ipcRenderer.invoke('app:openUpdateDownload');

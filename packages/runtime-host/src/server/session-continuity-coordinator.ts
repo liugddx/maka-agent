@@ -1,18 +1,24 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import type { SessionEvent } from '@maka/core/events';
+import type { SessionEvent, ShellRunUpdate } from '@maka/core/events';
+import type { StoredMessage } from '@maka/core/session';
 import {
   encodeProtocolFrame,
   RUNTIME_HOST_MAX_FRAME_BYTES,
   SESSION_LIVE_DELTA_MAX_BYTES,
+  SESSION_RUNTIME_RESOURCE_CHANGES_MAX,
   SESSION_TOOL_NAME_MAX_BYTES,
   type AgentGraphChangedFrame,
   type AgentGraphChangedReason,
   type SessionAssistantDelta,
   type SessionContinuitySnapshot,
   type SessionDeltaFrame,
+  type SessionDomainChange,
+  type SessionDomainChangedFrame,
   type SessionEventFrame,
   type SessionToolEvent,
+  type SessionTranscriptQueryInput,
+  type OperationOutcome,
   type SubscriptionFrame,
   type SubscriptionOpenResult,
   type TurnSnapshot,
@@ -28,6 +34,7 @@ import type {
   SessionContinuityFrameSink,
   SessionContinuityService,
 } from './session-continuity-service.js';
+import { TranscriptSnapshotStore } from './transcript-snapshot-store.js';
 
 const MAX_CONNECTION_SUBSCRIPTIONS = 16;
 const MAX_SUBSCRIBER_QUEUED_FRAMES = 32;
@@ -52,10 +59,16 @@ export type ReadCanonicalSessionProjection = (
   sessionId: string,
 ) => Promise<CanonicalSessionProjection | null>;
 
+export type ReadSessionTranscript = (
+  sessionId: string,
+  rootTurn: TurnSnapshot | null,
+) => Promise<readonly StoredMessage[]>;
+
 interface SessionProjectionState {
   canonical: CanonicalSessionProjection;
   revision: number;
   subscribers: Map<string, Subscriber>;
+  assistantOffsets: Map<string, number>;
   terminalPublicationFence?: TerminalPublicationFence;
 }
 
@@ -103,6 +116,13 @@ interface PendingAgentGraphChange {
   };
 }
 
+type SessionProjectionDomain = Exclude<SessionDomainChange['domain'], 'runtime_resource'>;
+
+interface PendingSessionDomainChanges {
+  readonly domains: Set<SessionProjectionDomain>;
+  readonly runtimeResources: Map<string, { sourceSessionId: string; ref: string }>;
+}
+
 export class SessionContinuityCoordinator implements SessionContinuityService {
   readonly handlers: SessionContinuityOperationHandlerMap = {
     'subscription.open': async (input, context) => {
@@ -120,15 +140,20 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
             error: { code: 'not_found', message: 'Session subscription was not found' },
           };
     },
+    'session.transcript.query': (input, context) =>
+      this.#queryTranscript(context.connectionId, input),
   };
 
   readonly #connections = new Map<string, ConnectionState>();
   readonly #sessions = new Map<string, SessionProjectionState>();
   readonly #subscriptions = new Map<string, Subscriber>();
+  readonly #transcriptSnapshots = new TranscriptSnapshotStore();
   readonly #pendingRefreshes = new Map<string, PendingRefresh>();
   readonly #pendingAgentGraphChanges = new Map<string, PendingAgentGraphChange>();
+  readonly #pendingSessionDomainChanges = new Map<string, PendingSessionDomainChanges>();
   readonly #hostEpoch: string;
   readonly #readCanonical: ReadCanonicalSessionProjection;
+  readonly #readTranscript: ReadSessionTranscript | undefined;
   #closed = false;
 
   constructor(
@@ -136,9 +161,11 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     readCanonical: ReadCanonicalSessionProjection,
     private readonly sessionAdmission: SessionAdmissionGate,
     private readonly onPublicationFailure: (error: unknown) => void = () => undefined,
+    readTranscript?: ReadSessionTranscript,
   ) {
     this.#hostEpoch = hostEpoch;
     this.#readCanonical = readCanonical;
+    this.#readTranscript = readTranscript;
   }
 
   attachConnection(
@@ -256,6 +283,90 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
       });
   }
 
+  /** Coalesce domain projection invalidations onto the Session subscription sequence. */
+  enqueueSessionDomainChanged(sessionId: string, domain: SessionProjectionDomain): void {
+    if (this.#closed) return;
+    const pending = this.#pendingSessionDomainChanges.get(sessionId);
+    if (pending) {
+      pending.domains.add(domain);
+      return;
+    }
+    const changes: PendingSessionDomainChanges = {
+      domains: new Set([domain]),
+      runtimeResources: new Map(),
+    };
+    this.#pendingSessionDomainChanges.set(sessionId, changes);
+    this.#scheduleSessionDomainChanges(sessionId, changes);
+  }
+
+  /** Publish one lightweight source invalidation to every active Session view that may inherit it. */
+  enqueueRuntimeResourceChanged(update: ShellRunUpdate): void {
+    if (this.#closed) return;
+    const resource = { sourceSessionId: update.sessionId, ref: update.result.ref };
+    const key = JSON.stringify([resource.sourceSessionId, resource.ref]);
+    for (const sessionId of this.#sessions.keys()) {
+      const pending = this.#pendingSessionDomainChanges.get(sessionId);
+      if (pending) {
+        pending.runtimeResources.set(key, resource);
+        continue;
+      }
+      const changes: PendingSessionDomainChanges = {
+        domains: new Set(),
+        runtimeResources: new Map([[key, resource]]),
+      };
+      this.#pendingSessionDomainChanges.set(sessionId, changes);
+      this.#scheduleSessionDomainChanges(sessionId, changes);
+    }
+  }
+
+  #scheduleSessionDomainChanges(sessionId: string, changes: PendingSessionDomainChanges): void {
+    void this.sessionAdmission
+      .enqueueDetached(sessionId, () => {
+        if (this.#pendingSessionDomainChanges.get(sessionId) !== changes) return;
+        this.#pendingSessionDomainChanges.delete(sessionId);
+        if (this.#closed) return;
+        const state = this.#sessions.get(sessionId);
+        if (!state) return;
+        const frames: SessionDomainChange[] = [...changes.domains].map((domain) => ({
+          sessionId,
+          domain,
+        }));
+        const runtimeResources = [...changes.runtimeResources.values()];
+        for (
+          let offset = 0;
+          offset < runtimeResources.length;
+          offset += SESSION_RUNTIME_RESOURCE_CHANGES_MAX
+        ) {
+          frames.push({
+            sessionId,
+            domain: 'runtime_resource',
+            resources: runtimeResources.slice(
+              offset,
+              offset + SESSION_RUNTIME_RESOURCE_CHANGES_MAX,
+            ),
+          });
+        }
+        for (const change of frames) {
+          for (const subscriber of state.subscribers.values()) {
+            const frame: SessionDomainChangedFrame = {
+              kind: 'subscription.session_domain_changed',
+              hostEpoch: this.#hostEpoch,
+              subscriptionId: subscriber.subscriptionId,
+              sequence: subscriber.nextSequence,
+              ...change,
+            };
+            this.#enqueue(subscriber, frame);
+          }
+        }
+      })
+      .catch((error: unknown) => {
+        if (this.#pendingSessionDomainChanges.get(sessionId) === changes) {
+          this.#pendingSessionDomainChanges.delete(sessionId);
+        }
+        this.onPublicationFailure(error);
+      });
+  }
+
   async holdTerminalPublication(
     sessionId: string,
     turnId: string,
@@ -323,6 +434,9 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         state.canonical = canonical;
         state.revision = nextRevision;
         delete state.terminalPublicationFence;
+        for (const key of state.assistantOffsets.keys()) {
+          if (key.startsWith(`${runId}\0`)) state.assistantOffsets.delete(key);
+        }
         this.#broadcastProjection(state, snapshot);
         if (state.subscribers.size === 0) this.#sessions.delete(sessionId);
       },
@@ -348,9 +462,13 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     ) {
       return;
     }
-    await this.sessionAdmission.run(sessionId, () => {
-      const state = this.#sessions.get(sessionId);
-      if (!state || state.subscribers.size === 0) return;
+    await this.sessionAdmission.run(sessionId, async () => {
+      let state = this.#sessions.get(sessionId);
+      if (!state) {
+        const canonical = await this.#readCanonicalProjection(sessionId);
+        if (!canonical) throw new Error('Runtime event belongs to a missing Session');
+        state = this.#commitCanonical(sessionId, canonical).state;
+      }
       const rootTurn = state.canonical.rootTurn;
       if (
         !rootTurn ||
@@ -365,8 +483,11 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
       if (event.type === 'text_delta' || event.type === 'thinking_delta') {
         const kind: SessionAssistantDelta['kind'] =
           event.type === 'text_delta' ? 'text' : 'thinking';
+        const offsetKey = assistantOffsetKey(runId, kind, event.messageId);
+        const startOffset = state.assistantOffsets.get(offsetKey) ?? 0;
+        state.assistantOffsets.set(offsetKey, startOffset + event.text.length);
         for (const subscriber of state.subscribers.values()) {
-          this.#enqueueAssistantDelta(subscriber, sessionId, runId, event, kind);
+          this.#enqueueAssistantDelta(subscriber, sessionId, runId, event, kind, startOffset);
         }
         return;
       }
@@ -399,6 +520,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
           for (const subscriber of state.subscribers.values()) {
             this.#enqueueSessionRemoved(subscriber);
           }
+          this.#transcriptSnapshots.deleteSession(sessionId);
           this.#sessions.delete(sessionId);
         },
         admission,
@@ -412,8 +534,10 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     for (const connectionId of [...this.#connections.keys()]) this.#closeConnection(connectionId);
     this.#sessions.clear();
     this.#subscriptions.clear();
+    this.#transcriptSnapshots.close();
     this.#pendingRefreshes.clear();
     this.#pendingAgentGraphChanges.clear();
+    this.#pendingSessionDomainChanges.clear();
   }
 
   async #open(
@@ -492,6 +616,59 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     }
   }
 
+  async #queryTranscript(
+    connectionId: string,
+    input: SessionTranscriptQueryInput,
+  ): Promise<OperationOutcome<'session.transcript.query'>> {
+    const subscriber = this.#ownedSubscriber(connectionId, input.subscriptionId);
+    if (!subscriber) {
+      return {
+        ok: false,
+        error: { code: 'not_found', message: 'Session subscription was not found' },
+      };
+    }
+    if (!this.#readTranscript) {
+      return {
+        ok: false,
+        error: { code: 'operation_unavailable', message: 'Session transcript is unavailable' },
+      };
+    }
+    if (input.kind === 'continue') {
+      return this.#transcriptSnapshots.continue({
+        connectionId,
+        subscriptionId: input.subscriptionId,
+        snapshotId: input.snapshotId,
+        cursor: { messageIndex: input.messageIndex, byteOffset: input.byteOffset },
+      });
+    }
+    const readTranscript = this.#readTranscript;
+    return this.sessionAdmission.run(subscriber.sessionId, async () => {
+      if (this.#ownedSubscriber(connectionId, input.subscriptionId) !== subscriber) {
+        return transcriptSubscriptionNotFound();
+      }
+      try {
+        const messages = await readTranscript(
+          subscriber.sessionId,
+          this.#sessions.get(subscriber.sessionId)?.canonical.rootTurn ?? null,
+        );
+        if (this.#ownedSubscriber(connectionId, input.subscriptionId) !== subscriber) {
+          return transcriptSubscriptionNotFound();
+        }
+        return this.#transcriptSnapshots.start({
+          connectionId,
+          subscriptionId: subscriber.subscriptionId,
+          sessionId: subscriber.sessionId,
+          messages,
+        });
+      } catch {
+        return {
+          ok: false,
+          error: { code: 'persistence_failed', message: 'Session transcript is unavailable' },
+        };
+      }
+    });
+  }
+
   #activate(connectionId: string, subscriptionId: string): void {
     const subscriber = this.#ownedSubscriber(connectionId, subscriptionId);
     if (!subscriber || subscriber.activated || subscriber.phase === 'closed') return;
@@ -527,6 +704,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
       if (subscriber) this.#removeSubscriber(subscriber);
     }
     this.#connections.delete(connectionId);
+    this.#transcriptSnapshots.deleteConnection(connectionId);
   }
 
   #enqueue(subscriber: Subscriber, frame: SubscriptionFrame): void {
@@ -584,17 +762,26 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     runId: string,
     event: Extract<RuntimeSessionTransientEvent, { type: 'text_delta' | 'thinking_delta' }>,
     kind: SessionAssistantDelta['kind'],
+    startOffset: number,
   ): void {
     let chunk = '';
     let rawBytes = 0;
     let wireBytes = 0;
+    let emittedCharacters = 0;
     const frame = (text: string): SessionDeltaFrame => ({
       kind: 'subscription.session_delta',
       hostEpoch: this.#hostEpoch,
       subscriptionId: subscriber.subscriptionId,
       sequence: subscriber.nextSequence,
       sessionId,
-      delta: { kind, turnId: event.turnId, runId, messageId: event.messageId, text },
+      delta: {
+        kind,
+        turnId: event.turnId,
+        runId,
+        messageId: event.messageId,
+        startOffset: startOffset + emittedCharacters,
+        text,
+      },
     });
     let wireLimit = wireTextByteLimit(frame(''));
     for (const character of event.text) {
@@ -606,6 +793,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
           wireBytes + wireCharacterBytes > wireLimit)
       ) {
         this.#enqueue(subscriber, frame(chunk));
+        emittedCharacters += chunk.length;
         if (subscriber.phase !== 'open') return;
         chunk = '';
         rawBytes = 0;
@@ -684,6 +872,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     const state = this.#sessions.get(subscriber.sessionId);
     const removed = state?.subscribers.delete(subscriber.subscriptionId);
     this.#subscriptions.delete(subscriber.subscriptionId);
+    this.#transcriptSnapshots.deleteSubscription(subscriber.subscriptionId);
     this.#connections
       .get(subscriber.connectionId)
       ?.subscriptionIds.delete(subscriber.subscriptionId);
@@ -705,7 +894,8 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
       if (
         this.#sessions.get(sessionId) === state &&
         state.subscribers.size === 0 &&
-        !state.terminalPublicationFence
+        !state.terminalPublicationFence &&
+        (!state.canonical.rootTurn || isTerminalTurn(state.canonical.rootTurn))
       ) {
         this.#sessions.delete(sessionId);
       }
@@ -738,7 +928,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     }
     if (!state) {
       const value = createSessionContinuitySnapshot(canonical, 1);
-      state = { canonical, revision: 1, subscribers: new Map() };
+      state = { canonical, revision: 1, subscribers: new Map(), assistantOffsets: new Map() };
       this.#sessions.set(sessionId, state);
       return { changed: true, state, value };
     }
@@ -788,6 +978,21 @@ function slowConsumerFrameBytes(subscriber: Subscriber, hostEpoch: string): numb
     sequence: subscriber.nextSequence + 1,
     reason: 'slow_consumer',
   }).byteLength;
+}
+
+function assistantOffsetKey(
+  runId: string,
+  kind: SessionAssistantDelta['kind'],
+  messageId: string,
+): string {
+  return `${runId}\0${kind}\0${messageId}`;
+}
+
+function transcriptSubscriptionNotFound(): OperationOutcome<'session.transcript.query'> {
+  return {
+    ok: false,
+    error: { code: 'not_found', message: 'Session subscription was not found' },
+  };
 }
 
 function terminalFrameByteBudget(subscriber: Subscriber, hostEpoch: string): number {
