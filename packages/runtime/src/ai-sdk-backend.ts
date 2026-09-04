@@ -618,6 +618,28 @@ async function validateCodeModeToolInput(tool: MakaTool, input: unknown): Promis
   throw invalidCodeModeToolArguments(tool.name, validator.errors);
 }
 
+export function validateJsonSchemaInput(
+  schema: unknown,
+  input: unknown,
+):
+  | { readonly success: true; readonly value: unknown }
+  | { readonly success: false; readonly error: Error } {
+  const validator = compileCodeModeJsonSchema(schema);
+  if (!validator || validator(input)) return { success: true, value: input };
+  return {
+    success: false,
+    error: new Error(schemaErrorSummary(validator.errors)),
+  };
+}
+
+function hasDraft7TupleItems(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(hasDraft7TupleItems);
+  const schema = value as Record<string, unknown>;
+  if (Array.isArray(schema.items)) return true;
+  return Object.values(schema).some(hasDraft7TupleItems);
+}
+
 function compileCodeModeJsonSchema(schema: unknown): ValidateFunction | undefined {
   if (typeof schema === 'boolean') return codeModeDraft2020Validator.compile(schema);
   if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) return undefined;
@@ -625,11 +647,13 @@ function compileCodeModeJsonSchema(schema: unknown): ValidateFunction | undefine
   if (cached) return cached;
   const declaredDialect = (schema as { readonly $schema?: unknown }).$schema;
   const dialect = typeof declaredDialect === 'string' ? declaredDialect : '';
-  const validator = dialect.includes('draft-07')
+  const validator = hasDraft7TupleItems(schema)
     ? codeModeDraft7Validator
-    : dialect.includes('2019-09')
-      ? codeModeDraft2019Validator
-      : codeModeDraft2020Validator;
+    : dialect.includes('draft-07')
+      ? codeModeDraft7Validator
+      : dialect.includes('2019-09')
+        ? codeModeDraft2019Validator
+        : codeModeDraft2020Validator;
   const schemaForCompile = dialect.startsWith('https://json-schema.org/draft-07/schema')
     ? { ...schema, $schema: dialect.replace('https://', 'http://') }
     : schema;
